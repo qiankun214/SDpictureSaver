@@ -43,14 +43,17 @@ python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/s
 ```
 
 > 仓库根目录的 `pip.conf` 是项目级镜像配置示例。
-> 本项目**不需要安装**即可运行（`run_web.ps1` 会自动把 `src` 加入 `PYTHONPATH`）；
+> 本项目**不需要安装**即可运行（`run_web.cmd` / `run_web.ps1` 会自动把 `src` 加入 `PYTHONPATH`）；
 > 也可以 `python -m pip install -e . -i https://pypi.tuna.tsinghua.edu.cn/simple` 安装成 `picsaver` 命令。
 
 ## 3. 使用：Web 界面（推荐）
 
 ```powershell
-.\run_web.ps1            # 默认 http://127.0.0.1:8765/
-.\run_web.ps1 9000       # 指定端口
+.\run_web.cmd            # 推荐：默认 http://127.0.0.1:8765/（批处理，不受 PowerShell 执行策略影响）
+.\run_web.cmd 9000       # 指定端口
+
+# 也可以用 PowerShell 脚本（若被执行策略拦截，就加 -ExecutionPolicy Bypass）
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run_web.ps1 8765
 ```
 
 浏览器打开后：
@@ -148,7 +151,7 @@ python -m pytest -q          # 56 项单元/接口/端到端测试
 
 ```powershell
 # 1) 启动后端
-.\run_web.ps1 8791
+.\run_web.cmd 8791
 
 # 2) 启动无头 Edge（另开一个终端）
 & 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe' `
@@ -167,6 +170,8 @@ python scripts\verify_browser.py --base-url http://127.0.0.1:8791
 - **能重复运行吗？** 可以。已存在且大小相同的文件会记为"已存在跳过"，不会重复写入。
 - **会修改 SD 卡吗？** 不会。全程只读源目录，只做复制。
 - **速度显示 `—`？** 复制刚开始不足 0.2 秒时无法估算速度与 ETA，稍后即会出现。
+- **`.\run_web.ps1` 报"未对文件进行数字签名"？** 这是 PowerShell 执行策略的限制，用 `.\run_web.cmd`，或执行
+  `powershell -NoProfile -ExecutionPolicy Bypass -File .\run_web.ps1`。
 - **目标父文件夹不能放在源目录里？** 会被拒绝，避免把刚拷贝出来的文件再次当成源文件。
 
 ---

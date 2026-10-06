@@ -104,7 +104,9 @@ pictureSaver2/
 ├─ pyproject.toml          # 项目与依赖声明
 ├─ requirements.txt        # 运行依赖（与 pyproject 一致）
 ├─ pip.conf                # 清华镜像固定配置
-├─ run_web.ps1             # 一键启动 Web 界面
+├─ run_web.cmd             # 一键启动 Web 界面（推荐：批处理不受 PowerShell 执行策略限制）
+├─ run_web.ps1             # 同上（PowerShell 版，纯 ASCII 输出，兼容 PowerShell 5.1）
+├─ scripts/                # 可复现的验证脚本（如无头浏览器端到端验证）
 ├─ src/picsaver/
 │  ├─ core/                # 纯内核：不依赖 UI / Web / CLI
 │  ├─ api/                 # FastAPI 后端（调用 core）
@@ -121,4 +123,5 @@ pictureSaver2/
 - 复制过程要防重名、防半截文件：先写临时文件再改名，目标文件已存在同名同大小视为已存在。
 - 一切验证以"实际运行 + pytest"为准，不靠口头声称。
 - 源文件一律 UTF-8；**禁止用 PowerShell 的 `-replace` / `Set-Content` 改写源码或文档**（会把 UTF-8 变成乱码），改文件只用编辑器工具。
+- `.ps1` 脚本内**不要写非 ASCII 字符**：Windows PowerShell 5.1 对无 BOM 的 `.ps1` 按 ANSI 解码，中文会直接导致语法错误（本机 `pwsh` 7 未安装，默认用 `powershell.exe` 5.1）。
 - 运行 CLI / 脚本时设置 `PYTHONIOENCODING=utf-8`，避免 Windows 控制台中文乱码。
