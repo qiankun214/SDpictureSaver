@@ -131,3 +131,18 @@ def test_scan_can_be_canceled(tmp_path) -> None:
     assert result.canceled is True
     assert result.matched_files == 60  # 统计阶段已经完成
     assert seen["events"] >= 2
+
+
+def test_scan_canceled_before_reading_times(tmp_path) -> None:
+    """一开始就被取消：不应再去读 EXIF，结果标记 canceled。"""
+    import threading
+
+    card = tmp_path / "card"
+    make_pair(card, "DSC00001", datetime(2026, 7, 4, 10, 0, 0), suffixes=("jpg", "arw"))
+
+    cancel = threading.Event()
+    cancel.set()
+    result = scan_directory(card, ["jpg", "arw"], cancel=cancel)
+    assert result.canceled is True
+    assert result.matched_files == 2
+    assert all(group.capture_time is None for group in result.groups)

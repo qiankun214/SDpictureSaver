@@ -125,3 +125,6 @@ pictureSaver2/
 - 源文件一律 UTF-8；**禁止用 PowerShell 的 `-replace` / `Set-Content` 改写源码或文档**（会把 UTF-8 变成乱码），改文件只用编辑器工具。
 - `.ps1` 脚本内**不要写非 ASCII 字符**：Windows PowerShell 5.1 对无 BOM 的 `.ps1` 按 ANSI 解码，中文会直接导致语法错误（本机 `pwsh` 7 未安装，默认用 `powershell.exe` 5.1）。
 - 运行 CLI / 脚本时设置 `PYTHONIOENCODING=utf-8`，避免 Windows 控制台中文乱码。
+- 目录列举一律用 `os.scandir` 且**只处理需要的类型**（浏览接口只列文件夹，绝不对普通文件做 stat）：大目录下重复 stat 是主要卡顿来源。
+- 任何耗时操作（扫描 / 预览 / 拷贝）都必须走**后台任务 + 真实进度**，不允许"转圈等待"式交互；进度必须来自 core 的真实回调。
+- 任务运行期间界面必须**锁定配置区**（`fieldset[disabled]`），只保留取消操作，避免中途改参数导致结果与预期不符。

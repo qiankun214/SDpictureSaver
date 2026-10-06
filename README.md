@@ -7,13 +7,17 @@
 - **命令行**：`picsaver scan` / `picsaver copy` / `picsaver web`，带 tqdm 进度条
 - **前后端分离**：`core`（纯业务内核）← `api`（FastAPI）/ `cli`，后续可平滑扩展桌面 UI
 
-界面与产出的实际效果（无头 Edge 实跑截图，600 MB 素材）：
+界面与产出的实际效果（无头 Edge 真实浏览器实跑截图，608 个文件 / 600 MB 素材）：
 
 ![界面初始状态](docs/screenshots/01-initial.png)
 
-![拷贝中的真实进度](docs/screenshots/04-progress-2.png)
+![目录浏览：只列文件夹 + 新建文件夹](docs/screenshots/02-browse.png)
 
-![完成后的执行报告](docs/screenshots/05-report.png)
+![扫描任务的真实进度（已扫描 X / 共 Y 个文件）](docs/screenshots/04-scan-job.png)
+
+![任务运行中配置区锁定](docs/screenshots/05-copy-locked.png)
+
+![完成后的执行报告](docs/screenshots/06-report.png)
 
 ---
 
@@ -112,6 +116,8 @@ python -m picsaver web --host 127.0.0.1 --port 8765
 其中 `mode="scan"` 只要求 `source_dir` 与 `suffixes`（日期/地点/备注/目标目录可以是空的），
 `preview` / `copy` 则要求字段齐全，否则返回 400 与中文提示。
 `mode` 省略时按 `dry_run ? "preview" : "copy"` 处理（兼容旧调用）。
+`/api/mkdir` 的所有失败情况（名称为空、含非法字符、首尾空格或点、重名、Windows 保留名、父目录不存在）
+统一返回 **400 + 中文字符串 `detail`**，便于界面直接展示。
 
 进度对象（SSE 事件与轮询同构）：
 
@@ -163,10 +169,14 @@ python -m pytest -q          # 56 项单元/接口/端到端测试
 
 已完成的实机验证：
 
-1. `pytest` **57 项全绿**（core 扫描/计划/复制、API 全部端点、端到端流程，以及用真实 uvicorn + SSE 的进度流测试）
-2. 真实 `uvicorn` 服务 + 136 个文件的模拟存储卡：扫描 → 预览 → 任务 → **SSE 收到 124 条真实进度事件** → 落盘结构核对，33 项检查全过
-3. **无头 Edge 真实浏览器**（`scripts/verify_browser.py`）：填写表单 → 扫描 → 预览 → 拷贝 600 MB，进度 0% → 50% → 100%，速度 1437 MB/s，报告 8/8 成功，产物字节与源完全一致，全程无 JS 错误
-4. CLI 三种模式（scan / dry-run / 真实拷贝）实跑通过
+1. `pytest` **84 项全绿**（core 扫描/计划/复制、任务模式与扫描进度、API 全部端点、目录浏览与新建文件夹、端到端流程，以及真实 uvicorn + SSE 进度流）
+2. 真实 `uvicorn` 服务 + 90 个文件的模拟存储卡：**26 项检查全过**，含浏览 20000 文件目录耗时 **11 ms**、扫描任务进度真实推进、预览任务未落盘
+3. **无头 Edge 真实浏览器**（`scripts/verify_browser.py`）：**35 项检查全过** ——
+   两万文件目录浏览 10.8 ms 且只列出 3 个文件夹、弹窗内新建文件夹并自动进入（重名有提示）、
+   扫描/预览/拷贝三个阶段都有真实进度（扫描阶段显示「已扫描 544 / 共 608 个文件」）、
+   任务运行中配置区锁定且只留「取消任务」、结束后自动解锁，608 个文件全部复制成功、字节与源一致、全程无 JS 错误
+4. 目录浏览性能基线可复现：`python scripts\bench_browse.py`（20000 文件：旧实现 ~1435 ms → 新实现 ~15 ms）
+5. CLI 四种用法（scan / dry-run / 真实拷贝 / web）实跑通过，扫描与复制都有 tqdm 进度条
 
 ### 复现浏览器验证
 

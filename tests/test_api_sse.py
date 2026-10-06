@@ -159,3 +159,35 @@ def test_preview_job_streams_scan_progress(live_server, card, tmp_path) -> None:
         assert terminal["report"]["mode"] == "preview"
         assert terminal["report"]["plan"]["planned_files"] == 10
         assert not out.exists(), "预览任务绝不能写盘"
+
+
+def test_terminal_event_always_has_terminal_phase(live_server, card) -> None:
+    """终局事件的 phase 必须是终局阶段（finished/canceled），不能停留在 scanning。"""
+    config = {
+        "source_dir": str(card),
+        "suffixes": ["jpg", "arw"],
+        "date_from": "2026-07-04",
+        "date_to": "2026-07-06",
+        "target_parent": "",
+        "place": "",
+        "note": "",
+        "recursive": True,
+    }
+    with httpx.Client(base_url=live_server, timeout=30.0) as client:
+        job = client.post("/api/jobs", json={"config": config, "mode": "scan"}).json()
+        # 立刻尝试取消（可能来不及，两种结果都合法，但 phase 必须与 status 对应）
+        client.post(f"/api/jobs/{job['job_id']}/cancel")
+
+        terminal = {}
+        with client.stream("GET", f"/api/jobs/{job['job_id']}/events", timeout=60.0) as stream:
+            for line in stream.iter_lines():
+                if not line.startswith("data:"):
+                    continue
+                payload = json.loads(line[5:].strip())
+                if "status" in payload:
+                    terminal = payload
+                    break
+
+        expected = {"done": "finished", "canceled": "canceled", "failed": "failed"}
+        assert terminal, "没有收到终局事件"
+        assert terminal["phase"] == expected[terminal["status"]], terminal

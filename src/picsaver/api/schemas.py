@@ -142,29 +142,34 @@ class JobCreateRequest(BaseModel):
 
 
 class MkdirRequest(BaseModel):
-    """在指定父目录下新建文件夹的请求。"""
+    """在指定父目录下新建文件夹的请求。
+
+    名称的具体规则在 :func:`validate_folder_name` 里校验，以便统一返回
+    HTTP 400 + 中文字符串错误（与"父目录不存在"等错误保持一致）。
+    """
 
     parent: str
     name: str
 
-    @validator("parent")
-    def _check_parent(cls, value: str) -> str:  # noqa: D102
-        text = (value or "").strip().strip('"')
-        if not text:
-            raise ValueError("父目录不能为空")
-        return text
 
-    @validator("name")
-    def _check_name(cls, value: str) -> str:  # noqa: D102
-        text = (value or "").strip()
-        if not text:
-            raise ValueError("文件夹名不能为空")
-        if _INVALID_NAME.search(text):
-            raise ValueError('文件夹名不能包含 < > : " / \\ | ? * 等字符')
-        if text in (".", "..") or text.strip(".") == "":
-            raise ValueError("文件夹名不合法")
-        if text.upper() in _RESERVED_NAMES:
-            raise ValueError(f"{text} 是 Windows 保留名称，请换一个")
-        if len(text) > 100:
-            raise ValueError("文件夹名过长（最多 100 个字符）")
-        return text
+def validate_folder_name(name: str) -> str:
+    """校验新建文件夹的名称。
+
+    :return: 去掉首尾空白后的名称
+    :raises ConfigError: 名称为空、含首尾空白/点、含非法字符、是保留名或过长
+    """
+    raw = name or ""
+    text = raw.strip()
+    if not text:
+        raise ConfigError("文件夹名不能为空")
+    if text != raw:
+        raise ConfigError("文件夹名首尾不能有空格")
+    if text != text.strip("."):
+        raise ConfigError("文件夹名首尾不能是点")
+    if _INVALID_NAME.search(text):
+        raise ConfigError('文件夹名不能包含 < > : " / \\ | ? * 等字符')
+    if text.upper() in _RESERVED_NAMES:
+        raise ConfigError(f"{text} 是 Windows 保留名称，请换一个")
+    if len(text) > 100:
+        raise ConfigError("文件夹名过长（最多 100 个字符）")
+    return text

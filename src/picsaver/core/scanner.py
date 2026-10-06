@@ -76,15 +76,28 @@ def _is_inside(child: str | Path, parent: str | Path) -> bool:
     return child_norm.startswith(parent_norm.rstrip("\\/") + os.sep)
 
 
-def _iter_files(root: Path, recursive: bool, excluded: Iterable[str] = ()) -> Iterator[Path]:
-    """遍历源目录下的文件，跳过系统目录与被排除目录（使用 scandir，不额外 stat）。"""
+def _iter_entries(
+    root: Path,
+    recursive: bool,
+    excluded: Iterable[str] = (),
+    cancel=None,
+) -> Iterator[os.DirEntry]:
+    """遍历源目录下的文件，跳过系统目录与被排除目录。
+
+    产出 :class:`os.DirEntry`（而不是 ``Path``）：目录项的大小/类型都来自
+    ``scandir`` 的缓存，不必为每个文件额外做一次 stat。
+    """
     excluded_norms = [_norm(item) for item in excluded]
     pending: list[Path] = [root]
+    checked = 0
     while pending:
         current = pending.pop()
         try:
             with os.scandir(current) as iterator:
                 for entry in iterator:
+                    checked += 1
+                    if cancel is not None and checked % 512 == 0 and cancel.is_set():
+                        return
                     try:
                         if entry.is_dir(follow_symlinks=False):
                             if not recursive:
@@ -97,7 +110,7 @@ def _iter_files(root: Path, recursive: bool, excluded: Iterable[str] = ()) -> It
                                 continue
                             pending.append(path)
                         elif entry.is_file(follow_symlinks=False):
-                            yield Path(entry.path)
+                            yield entry
                     except OSError:
                         continue
         except OSError:
@@ -109,40 +122,45 @@ def _collect_groups(
     wanted: set[str],
     recursive: bool,
     excluded: Iterable[str],
-) -> tuple[dict[str, PhotoGroup], Counter[str], int, int]:
-    """第一遍：按后缀收集文件并配对，返回 ``(分组, 后缀计数, 命中文件数, 总字节)``。"""
+    cancel=None,
+) -> tuple[dict[str, PhotoGroup], Counter[str], int, int, bool]:
+    """第一遍：按后缀收集文件并配对。
+
+    :return: ``(分组, 后缀计数, 命中文件数, 总字节, 是否被取消)``
+    """
     groups: dict[str, PhotoGroup] = {}
     suffix_counts: Counter[str] = Counter()
     total_bytes = 0
     matched_files = 0
 
-    for path in _iter_files(root, recursive, excluded):
-        suffix = path.suffix.lstrip(".").lower()
+    for entry in _iter_entries(root, recursive, excluded, cancel):
+        suffix = Path(entry.name).suffix.lstrip(".").lower()
         if suffix not in wanted:
             continue
         try:
-            size = path.stat().st_size
+            size = entry.stat(follow_symlinks=False).st_size
         except OSError:
             continue
+        path = Path(entry.path)
+        stem = Path(entry.name).stem
         try:
             rel_dir = path.parent.relative_to(root).as_posix()
         except ValueError:
             rel_dir = ""
         if rel_dir == ".":
             rel_dir = ""
-        key = f"{rel_dir.lower()}/{path.stem.lower()}"
+        key = f"{rel_dir.lower()}/{stem.lower()}"
         group = groups.get(key)
         if group is None:
             group = PhotoGroup(key=key)
             groups[key] = group
-        group.files[suffix] = SourceFile(
-            path=path, suffix=suffix, size=size, stem=path.stem, rel_dir=rel_dir
-        )
+        group.files[suffix] = SourceFile(path=path, suffix=suffix, size=size, stem=stem, rel_dir=rel_dir)
         suffix_counts[suffix] += 1
         total_bytes += size
         matched_files += 1
 
-    return groups, suffix_counts, matched_files, total_bytes
+    canceled_early = cancel is not None and cancel.is_set()
+    return groups, suffix_counts, matched_files, total_bytes, canceled_early
 
 
 def _resolve_group_time(group: PhotoGroup) -> None:
@@ -256,8 +274,8 @@ def scan_directory(
     wanted = set(normalize_suffixes(suffixes))
     emit(progress, ProgressEvent(phase=PHASE_COUNTING, message="正在统计需要处理的文件…"))
 
-    groups, suffix_counts, matched_files, total_bytes = _collect_groups(
-        root, wanted, recursive, exclude_dirs
+    groups, suffix_counts, matched_files, total_bytes, canceled_early = _collect_groups(
+        root, wanted, recursive, exclude_dirs, cancel
     )
 
     emit(
@@ -271,8 +289,8 @@ def scan_directory(
     )
 
     no_time: list[NoTimeFile] = []
-    canceled = False
-    if matched_files:
+    canceled = canceled_early
+    if matched_files and not canceled_early:
         no_time, _scanned, canceled = _resolve_times(groups, matched_files, progress, cancel)
     no_time.sort(key=lambda item: str(item.path))
 

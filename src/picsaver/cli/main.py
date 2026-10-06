@@ -12,7 +12,16 @@ from pathlib import Path
 import typer
 
 from .. import __version__
-from ..core.events import PHASE_CANCELED, PHASE_COPYING, PHASE_FAILED, PHASE_FINISHED, ProgressEvent
+from ..core.events import (
+    PHASE_CANCELED,
+    PHASE_COPYING,
+    PHASE_COUNTING,
+    PHASE_FAILED,
+    PHASE_FINISHED,
+    PHASE_PLANNING,
+    PHASE_SCANNING,
+    ProgressEvent,
+)
 from ..core.metrics import SpeedMeter
 from ..core.models import DEFAULT_SUFFIXES, ConfigError, CopyConfig, human_bytes, normalize_suffixes
 from ..core.service import CopyService
@@ -21,19 +30,51 @@ app = typer.Typer(add_completion=False, help="SD 卡照片按日期范围拷贝�
 
 
 class ConsoleProgress:
-    """把 core 进度事件渲染成 tqdm 进度条（真实进度：字节 / 文件数 / 速度 / ETA）。"""
+    """把 core 进度事件渲染成 tqdm 进度条（真实进度）。
+
+    - 统计 / 读取时间 / 生成计划：按"文件数"显示进度（扫描进度条）
+    - 复制：按"字节"显示进度、速度与 ETA
+    """
 
     def __init__(self, dry_run: bool = False) -> None:
         self.dry_run = dry_run
-        self.bar = None
+        self.scan_bar = None
+        self.copy_bar = None
         self.meter = SpeedMeter()
+        self._announced: set[str] = set()
         self._last_bytes = 0
+        self._last_files = 0
 
-    def __call__(self, event: ProgressEvent) -> None:
-        if event.phase == PHASE_COPYING and self.bar is None:
-            from tqdm import tqdm
+    # ---- 内部工具 ------------------------------------------------------
 
-            self.bar = tqdm(
+    def _announce(self, event: ProgressEvent) -> None:
+        """阶段提示只打印一次。"""
+        if event.phase in self._announced or not event.message:
+            return
+        self._announced.add(event.phase)
+        if self.copy_bar is None:
+            typer.echo(f"· {event.message}")
+
+    def _ensure_scan_bar(self, event: ProgressEvent):
+        from tqdm import tqdm
+
+        if self.scan_bar is None:
+            self.scan_bar = tqdm(
+                total=max(event.scan_total_files, 1),
+                unit="文件",
+                desc="扫描",
+                dynamic_ncols=True,
+            )
+        return self.scan_bar
+
+    def _ensure_copy_bar(self, event: ProgressEvent):
+        from tqdm import tqdm
+
+        if self.scan_bar is not None:
+            self.scan_bar.close()
+            self.scan_bar = None
+        if self.copy_bar is None:
+            self.copy_bar = tqdm(
                 total=max(event.total_bytes, 1),
                 unit="B",
                 unit_scale=True,
@@ -41,26 +82,51 @@ class ConsoleProgress:
                 desc="预览" if self.dry_run else "复制",
                 dynamic_ncols=True,
             )
-        if self.bar is None:
-            if event.message:
-                typer.echo(f"· {event.message}")
+        return self.copy_bar
+
+    def close(self) -> None:
+        """收尾：关闭所有进度条。"""
+        for bar in (self.scan_bar, self.copy_bar):
+            if bar is not None:
+                bar.close()
+        self.scan_bar = None
+        self.copy_bar = None
+
+    # ---- 事件入口 ------------------------------------------------------
+
+    def __call__(self, event: ProgressEvent) -> None:
+        if event.phase in (PHASE_COUNTING, PHASE_SCANNING, PHASE_PLANNING):
+            self._announce(event)
+            if event.scan_total_files > 0:
+                bar = self._ensure_scan_bar(event)
+                delta = max(0, event.scanned_files - self._last_files)
+                self._last_files = event.scanned_files
+                if delta:
+                    bar.update(delta)
+                bar.set_postfix_str(f"{event.scanned_files}/{event.scan_total_files} 个文件")
             return
-        delta = max(0, event.done_bytes - self._last_bytes)
-        self._last_bytes = event.done_bytes
-        if delta:
-            self.bar.update(delta)
-        self.meter.update(event.done_bytes)
-        speed = self.meter.speed_bps()
-        eta = self.meter.eta_seconds(max(0, event.total_bytes - event.done_bytes))
-        postfix = f"{event.done_files}/{event.total_files} 个文件"
-        if speed > 0:
-            postfix += f" | {human_bytes(speed)}/s"
-        if eta is not None:
-            postfix += f" | 剩余 {int(eta // 60):02d}:{int(eta % 60):02d}"
-        self.bar.set_postfix_str(postfix)
+
+        if event.phase == PHASE_COPYING:
+            self._announce(event)
+            bar = self._ensure_copy_bar(event)
+            delta = max(0, event.done_bytes - self._last_bytes)
+            self._last_bytes = event.done_bytes
+            if delta:
+                bar.update(delta)
+            self.meter.update(event.done_bytes)
+            speed = self.meter.speed_bps()
+            eta = self.meter.eta_seconds(max(0, event.total_bytes - event.done_bytes))
+            postfix = f"{event.done_files}/{event.total_files} 个文件"
+            if speed > 0:
+                postfix += f" | {human_bytes(speed)}/s"
+            if eta is not None:
+                postfix += f" | 剩余 {int(eta // 60):02d}:{int(eta % 60):02d}"
+            bar.set_postfix_str(postfix)
+            return
+
+        # 终局阶段
         if event.phase in (PHASE_FINISHED, PHASE_CANCELED, PHASE_FAILED):
-            self.bar.close()
-            self.bar = None
+            self.close()
 
 
 def _parse_suffixes(text: str) -> tuple[str, ...]:
@@ -84,12 +150,15 @@ def scan_command(
 ) -> None:
     """只扫描并统计，不复制任何文件。"""
     service = CopyService()
+    progress = ConsoleProgress()
     try:
         wanted = _parse_suffixes(suffixes)
-        result = service.scan(source, wanted, recursive=recursive)
+        result = service.scan(source, wanted, recursive=recursive, progress=progress)
     except (ConfigError, FileNotFoundError, NotADirectoryError) as exc:
         typer.secho(f"[错误] {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2) from exc
+    finally:
+        progress.close()
 
     data = result.to_dict()
     typer.echo(f"源目录          : {data['source_dir']}")
@@ -138,9 +207,7 @@ def copy_command(
     typer.echo(f"目标目录        : {config.target_dir}")
     progress = ConsoleProgress(dry_run=dry_run)
     plan, report = service.run(config, progress=progress, dry_run=dry_run)
-    if progress.bar is not None:
-        progress.bar.close()
-        progress.bar = None
+    progress.close()
 
     typer.echo("")
     typer.echo(report.to_text())

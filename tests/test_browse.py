@@ -106,18 +106,26 @@ def test_mkdir_creates_folder(client: TestClient, tmp_path) -> None:
         ({"parent": "", "name": "x"}, "父目录"),
         ({"parent": "E:\\this-path-does-not-exist-9f3a", "name": "x"}, "父目录"),
         ({"parent": "@parent@", "name": "   "}, "文件夹名"),
+        ({"parent": "@parent@", "name": " 前后有空格 "}, "空格"),
+        ({"parent": "@parent@", "name": ".开头有点"}, "点"),
+        ({"parent": "@parent@", "name": "结尾有点."}, "点"),
         ({"parent": "@parent@", "name": "bad/name"}, "文件夹名"),
         ({"parent": "@parent@", "name": "bad:name"}, "文件夹名"),
+        ({"parent": "@parent@", "name": "bad*name"}, "文件夹名"),
         ({"parent": "@parent@", "name": "CON"}, "保留"),
+        ({"parent": "@parent@", "name": "x" * 101}, "过长"),
     ],
 )
 def test_mkdir_rejects_invalid_input(client: TestClient, tmp_path, payload, keyword) -> None:
+    """所有名称/父目录错误都应该是 400 + 中文字符串 detail（便于界面直接展示）。"""
     parent = tmp_path / "parent"
     parent.mkdir()
     data = {key: (str(parent) if value == "@parent@" else value) for key, value in payload.items()}
     response = client.post("/api/mkdir", json=data)
-    assert response.status_code in (400, 422)
-    assert keyword in response.text
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert isinstance(detail, str), detail
+    assert keyword in detail
 
 
 def test_mkdir_rejects_existing_name(client: TestClient, tmp_path) -> None:

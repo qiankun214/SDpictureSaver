@@ -21,11 +21,17 @@ from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
 from .. import __version__
-from ..core.events import PHASE_FINISHED
+from ..core.events import PHASE_CANCELED, PHASE_FAILED, PHASE_FINISHED
 from ..core.models import DEFAULT_SUFFIXES, ConfigError
 from ..core.service import CopyService
 from .jobs import END_MARKER, JobManager, JobSpec
-from .schemas import CopyRequest, JobCreateRequest, MkdirRequest, ScanRequest
+from .schemas import (
+    CopyRequest,
+    JobCreateRequest,
+    MkdirRequest,
+    ScanRequest,
+    validate_folder_name,
+)
 
 #: 前端静态资源目录
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -175,17 +181,24 @@ def create_app() -> FastAPI:
     @application.post("/api/mkdir")
     def make_directory(request: MkdirRequest) -> dict[str, Any]:
         """在指定父目录下新建文件夹（给界面上的"新建文件夹"用）。"""
-        parent = Path(request.parent)
+        raw_parent = (request.parent or "").strip().strip('"')
+        if not raw_parent:
+            raise HTTPException(status_code=400, detail="父目录不能为空")
+        parent = Path(raw_parent)
         if not parent.exists() or not parent.is_dir():
             raise HTTPException(status_code=400, detail=f"父目录不存在或不是目录：{parent}")
-        target = parent / request.name
+        try:
+            name = validate_folder_name(request.name)
+        except ConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        target = parent / name
         if target.exists():
             raise HTTPException(status_code=400, detail=f"已存在同名文件或文件夹：{target}")
         try:
             target.mkdir()
         except OSError as exc:
             raise HTTPException(status_code=400, detail=f"创建文件夹失败：{exc}") from exc
-        return {"path": str(target), "name": request.name, "created": True}
+        return {"path": str(target), "name": name, "created": True}
 
     @application.post("/api/scan")
     def scan(request: ScanRequest) -> dict[str, Any]:
@@ -284,12 +297,15 @@ def create_app() -> FastAPI:
                 if END_MARKER in item:
                     break
                 yield {"data": json.dumps(item, ensure_ascii=False)}
-            final = dict(job.progress or {})
-            final.setdefault("phase", PHASE_FINISHED)
+            # 终局事件必须带终局阶段，覆盖上一次进度事件里的 scanning/copying
+            terminal_phase = {
+                "canceled": PHASE_CANCELED,
+                "failed": PHASE_FAILED,
+            }.get(job.status, PHASE_FINISHED)
             yield {
                 "data": json.dumps(
                     {
-                        "phase": final.get("phase"),
+                        "phase": terminal_phase,
                         "status": job.status,
                         "job_id": job.id,
                         "report": job.report,

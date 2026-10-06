@@ -5,13 +5,13 @@
  * 所有接口均以 window.location.origin 为基准，使用同源相对路径调用：
  *   GET  /api/health
  *   GET  /api/defaults
- *   GET  /api/browse
- *   POST /api/scan
- *   POST /api/preview
- *   POST /api/jobs
+ *   GET  /api/browse                  （只返回文件夹；含 truncated / total_dirs / elapsed_ms）
+ *   POST /api/mkdir                   （在指定父目录下新建文件夹）
+ *   POST /api/jobs                    （mode = scan | preview | copy，扫描 / 预览 / 拷贝统一走任务）
  *   GET  /api/jobs/{job_id}
  *   GET  /api/jobs/{job_id}/events    （SSE，失败时降级为 500ms 轮询）
  *   POST /api/jobs/{job_id}/cancel
+ * 扫描与预览不再调用同步接口 POST /api/scan、POST /api/preview，以便显示真实扫描进度。
  * 进度全部来自后端真实数据，界面不做任何假动画。
  */
 'use strict';
@@ -26,8 +26,7 @@
     health: '/api/health',
     defaults: '/api/defaults',
     browse: '/api/browse',
-    scan: '/api/scan',
-    preview: '/api/preview',
+    mkdir: '/api/mkdir',
     jobs: '/api/jobs',
     job: function (jobId) { return '/api/jobs/' + encodeURIComponent(jobId); },
     events: function (jobId) { return '/api/jobs/' + encodeURIComponent(jobId) + '/events'; },
@@ -40,15 +39,27 @@
   var ILLEGAL_CHARS = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
   var PHASE_LABELS = {
     idle: '等待开始',
+    counting: '统计中',
+    scanning: '扫描中',
     planning: '规划中',
     copying: '拷贝中',
     finished: '已完成',
     canceled: '已取消',
     failed: '失败'
   };
+  //: 任务模式 → 界面文案（三种模式共用一条进度条）
+  var JOB_MODES = {
+    scan: { loading: '扫描中…', startToast: '正在扫描源目录并读取 EXIF 拍摄时间…', phase: 'counting' },
+    preview: { loading: '计算中…', startToast: '正在扫描源目录并计算拷贝计划…', phase: 'counting' },
+    copy: { loading: '启动中…', startToast: '任务已启动，正在扫描源目录…', phase: 'counting' }
+  };
   var POLL_NOTICE = '实时连接已断开，已切换为轮询';
   var BASE_TITLE = 'pictureSaver · 按拍摄日期拷贝照片';
   var TERMINAL_PHASES = ['finished', 'canceled', 'failed'];
+  //: 终局状态（SSE 最后一条事件带 status；进度事件不带 status 字段）
+  var TERMINAL_STATUSES = ['done', 'canceled', 'failed'];
+  //: 扫描类阶段（进度按已扫描 / 待扫描文件数换算）
+  var SCAN_PHASES = ['counting', 'scanning'];
 
   /* ================= 状态 ================= */
 
@@ -58,13 +69,14 @@
     plan: null,
     planRequest: null,
     jobId: null,
+    jobMode: '',
     jobRunning: false,
     completing: false,
     es: null,
     pollTimer: null,
     pollJobId: null,
     errors: {},
-    browse: { mode: 'source', seq: 0, drives: [], path: '', parent: '' }
+    browse: { mode: 'source', seq: 0, drives: [], path: '', parent: '', busy: false }
   };
 
   var el = {};
@@ -115,6 +127,8 @@
     el.folderError = $('folder-error');
 
     el.formError = $('form-error');
+    el.configFields = $('config-fields');
+    el.configLockNotice = $('config-lock-notice');
     el.actions = $('actions');
     el.btnScan = $('btn-scan');
     el.btnPreview = $('btn-preview');
@@ -127,7 +141,10 @@
     el.progressFill = $('progress-fill');
     el.progressPercent = $('progress-percent');
     el.progressFiles = $('progress-files');
+    el.progressBytesLabel = $('progress-bytes-label');
     el.progressBytes = $('progress-bytes');
+    el.progressScanFiles = $('progress-scan-files');
+    el.progressScanLabel = $('progress-scan-label');
     el.progressSpeed = $('progress-speed');
     el.progressEta = $('progress-eta');
     el.progressElapsed = $('progress-elapsed');
@@ -195,6 +212,11 @@
     el.browserPath = $('browser-path');
     el.browserGo = $('browser-go');
     el.browserError = $('browser-error');
+    el.browserMeta = $('browser-meta');
+    el.browserNewName = $('browser-new-name');
+    el.browserMkdir = $('browser-mkdir');
+    el.browserNewHint = $('browser-new-hint');
+    el.browserNewError = $('browser-new-error');
     el.browserDrives = $('browser-drives');
     el.browserList = $('browser-list');
     el.browserLoading = $('browser-loading');
@@ -316,6 +338,32 @@
 
   /* ================= 接口请求 ================= */
 
+  /**
+   * 提取后端错误信息：
+   * - 业务错误 / HTTPException：``detail`` 是中文字符串；
+   * - pydantic 校验失败（HTTP 422）：``detail`` 是 ``[{loc, msg, type}]`` 数组，需要拼成人话。
+   */
+  function errorMessage(response, data) {
+    var detail = data ? data.detail : null;
+    if (typeof detail === 'string' && detail) { return detail; }
+    if (Array.isArray(detail)) {
+      var parts = [];
+      detail.forEach(function (item) {
+        if (item && typeof item.msg === 'string' && item.msg) {
+          var loc = Array.isArray(item.loc)
+            ? item.loc.filter(function (part) { return part !== 'body' && part !== 'query'; }).join('.')
+            : '';
+          parts.push(loc ? (loc + '：' + item.msg) : item.msg);
+        } else if (typeof item === 'string' && item) {
+          parts.push(item);
+        }
+      });
+      if (parts.length > 0) { return parts.join('；'); }
+    }
+    if (detail && typeof detail === 'object' && typeof detail.msg === 'string') { return detail.msg; }
+    return '请求失败（HTTP ' + response.status + '）';
+  }
+
   async function request(path, options) {
     var response = await fetch(absUrl(path), options);
     var raw = await response.text();
@@ -324,8 +372,7 @@
       try { data = JSON.parse(raw); } catch (err) { data = null; }
     }
     if (!response.ok) {
-      var detail = data && typeof data.detail === 'string' ? data.detail : '';
-      throw new Error(detail || ('请求失败（HTTP ' + response.status + '）'));
+      throw new Error(errorMessage(response, data));
     }
     if (data === null) { throw new Error('后端返回了无法解析的内容'); }
     return data;
@@ -523,6 +570,20 @@
     el.btnStart.disabled = busy || running || !configOk;
     el.btnCancel.disabled = !running || cancelBusy;
     el.actions.classList.toggle('is-running', running);
+    el.configFields.classList.toggle('is-locked', running);
+  }
+
+  /** 任务运行期间锁定整个配置区（fieldset.disabled 会连子元素一起禁用）。 */
+  function setConfigLocked(locked) {
+    el.configFields.disabled = !!locked;
+    setHidden(el.configLockNotice, !locked);
+  }
+
+  /** 统一维护「任务运行中」这一状态：配置区锁定 + 按钮可用性。 */
+  function setJobRunning(running) {
+    state.jobRunning = !!running;
+    setConfigLocked(state.jobRunning);
+    updateActionState();
   }
 
   function setLoading(button, loading, loadingText) {
@@ -544,7 +605,10 @@
     state.browse.mode = mode;
     setText(el.browserTitle, mode === 'source' ? '选择源目录（SD 卡 / 相机存储卡）' : '选择目的父文件夹');
     setHidden(el.browserModal, false);
-    setHidden(el.browserError, true);
+    setHint(el.browserError, '');
+    setHint(el.browserNewError, '');
+    el.browserNewName.value = '';
+    updateMkdirState();
     var start = mode === 'source' ? sourceDirValue() : targetParentValue();
     loadBrowse(start || '');
     window.setTimeout(function () { el.browserPath.focus(); }, 0);
@@ -555,11 +619,21 @@
     state.browse.seq += 1;
   }
 
+  /** 没有可用的当前目录时不允许新建文件夹。 */
+  function updateMkdirState() {
+    var blocked = state.browse.busy || !state.browse.path;
+    el.browserMkdir.disabled = blocked;
+    el.browserNewName.disabled = state.browse.busy;
+  }
+
   async function loadBrowse(path) {
     state.browse.seq += 1;
     var seq = state.browse.seq;
+    state.browse.busy = true;
+    updateMkdirState();
     setHidden(el.browserLoading, false);
     setHint(el.browserError, '');
+    setHint(el.browserNewError, '');
     var target = path ? API.browse + '?path=' + encodeURIComponent(path) : API.browse;
     try {
       var data = await request(target);
@@ -568,11 +642,34 @@
     } catch (err) {
       if (seq !== state.browse.seq) { return; }
       setHint(el.browserError, err.message);
+      setHint(el.browserMeta, '');
       // 目录列表不可用时仍允许手动输入路径，避免弹窗失去操作能力
       setText(el.browserCurrent, '当前目录：—（读取失败，可在上方手动输入路径后点「转到」）');
     } finally {
-      if (seq === state.browse.seq) { setHidden(el.browserLoading, true); }
+      if (seq === state.browse.seq) {
+        state.browse.busy = false;
+        setHidden(el.browserLoading, true);
+        updateMkdirState();
+      }
     }
+  }
+
+  /** 目录读取信息：总数 / 截断提示 / 后端读取耗时。 */
+  function renderBrowseMeta(data) {
+    if (!data || data.error) { setHint(el.browserMeta, ''); return; }
+    var total = data.total_dirs === null || data.total_dirs === undefined ? null : num(data.total_dirs);
+    var truncated = !!data.truncated;
+    var elapsed = data.elapsed_ms === null || data.elapsed_ms === undefined ? null : num(data.elapsed_ms);
+    if (total === null && !truncated && elapsed === null) { setHint(el.browserMeta, ''); return; }
+    var parts = [];
+    if (total !== null) {
+      if (truncated) { parts.push('共 ' + formatCount(total) + ' 个文件夹，仅显示前 2000 个'); }
+      else { parts.push('共 ' + formatCount(total) + ' 个文件夹'); }
+    } else if (truncated) {
+      parts.push('文件夹过多，仅显示前 2000 个');
+    }
+    if (elapsed !== null) { parts.push('读取耗时 ' + elapsed + ' ms'); }
+    setHint(el.browserMeta, parts.join(' · '));
   }
 
   function isDriveEntry(entry) { return /^[A-Za-z]:$/.test(String(entry.name || '')); }
@@ -589,6 +686,8 @@
     el.browserSelect.disabled = !currentPath;
     setText(el.browserCurrent, '当前目录：' + (currentPath || '（驱动器列表，请先选择磁盘）'));
     setHint(el.browserError, data && data.error ? data.error : '');
+    renderBrowseMeta(data);
+    updateMkdirState();
 
     dirs.forEach(function (entry) {
       if (!isDriveEntry(entry)) { return; }
@@ -657,35 +756,135 @@
     renderValidation();
   }
 
-  /* ================= 扫描 ================= */
+  /* ================= 新建文件夹（弹窗内联） ================= */
 
-  async function handleScan() {
-    if (el.btnScan.disabled) { return; }
-    setLoading(el.btnScan, true, '扫描中…');
-    renderValidation();
-    showToast('正在扫描源目录并读取 EXIF 拍摄时间…', 'info');
+  function validateNewFolderName(name) {
+    if (!name) { return '请输入新文件夹名称'; }
+    if (name !== name.trim()) { return '名称首尾不能是空格'; }
+    if (/^\./.test(name) || /\.$/.test(name)) { return '名称首尾不能是点（.）'; }
+    if (name.length > 100) { return '名称过长（最多 100 个字符）'; }
+    var bad = findIllegalChars(name);
+    if (bad.length > 0) { return '名称包含 Windows 非法字符：' + bad.join(' '); }
+    return '';
+  }
+
+  async function handleMkdir() {
+    if (!state.browse.path) {
+      setHint(el.browserNewError, '请先进入一个目录，再新建子文件夹');
+      return;
+    }
+    if (state.browse.busy) { return; }
+    // 保留原始输入（不 trim），让「首尾空格 / 点」这类问题由校验或后端如实报错
+    var name = el.browserNewName.value;
+    var issue = validateNewFolderName(name);
+    if (issue) {
+      setHint(el.browserNewError, issue);
+      el.browserNewName.focus();
+      return;
+    }
+
+    state.browse.busy = true;
+    updateMkdirState();
+    setHint(el.browserNewError, '');
+    var label = el.browserMkdir.textContent;
+    el.browserMkdir.textContent = '创建中…';
     try {
-      var data = await postJson(API.scan, {
-        source_dir: sourceDirValue(),
-        suffixes: selectedSuffixes(),
-        recursive: !!el.recursive.checked
-      });
-      state.scan = data;
-      state.scanRequest = {
-        source_dir: sourceDirValue(),
-        suffixes: selectedSuffixes(),
-        recursive: !!el.recursive.checked
-      };
-      renderScan(data);
-      updateLiveEmpty();
-      showToast('扫描完成：命中 ' + formatCount(data.matched_files) + ' 个文件，配对 ' + formatCount(data.groups) + ' 张照片', 'ok');
+      var data = await postJson(API.mkdir, { parent: state.browse.path, name: name });
+      var created = data && data.path ? data.path : '';
+      el.browserNewName.value = '';
+      showToast('已创建文件夹：' + (data && data.name ? data.name : name), 'ok');
+      state.browse.busy = false;
+      updateMkdirState();
+      if (created) { await loadBrowse(created); }
+      return;
     } catch (err) {
+      setHint(el.browserNewError, err.message);
+    } finally {
+      el.browserMkdir.textContent = label;
+      state.browse.busy = false;
+      updateMkdirState();
+    }
+  }
+
+  /* ================= 扫描 / 预览 / 拷贝：统一走后台任务 ================= */
+
+  /**
+   * 启动一个后台任务并接管进度条。
+   * mode 为 scan / preview / copy；三者在运行期间共用同一条进度条与同一个取消按钮。
+   */
+  async function startJob(mode) {
+    var conf = JOB_MODES[mode];
+    if (!conf || state.jobRunning) { return; }
+    var button = mode === 'scan' ? el.btnScan : (mode === 'preview' ? el.btnPreview : el.btnStart);
+    if (!button || button.disabled) { return; }
+
+    if (mode === 'scan') {
+      renderValidation();
+      if (!sourceDirValue() || selectedSuffixes().length === 0) {
+        showToast('请先填写源目录并至少勾选一个后缀', 'error');
+        return;
+      }
+    } else {
+      renderValidation({ showSummary: true });
+      if (Object.keys(state.errors).length > 0) {
+        showToast('配置不完整，请先修正左侧提示', 'error');
+        return;
+      }
+    }
+
+    // 扫描任务不需要日期 / 目的目录 / 地点 / 备注：后端对 scan 模式只校验源目录与后缀，
+    // 因此这里原样提交表单（空值以空字符串提交），不编造任何数据。
+    var config = buildConfig();
+    setLoading(button, true, conf.loading);
+    setJobRunning(true); // 立即锁定配置区：从提交那一刻起就不允许再改
+    state.jobId = null;
+    state.jobMode = mode;
+    state.completing = false;
+    if (mode === 'copy') {
+      setHidden(el.reportCard, true);
+      setHidden(el.reportError, true);
+      setHidden(el.failuresDetails, true);
+      setHidden(el.reportNoTimeDetails, true);
+    }
+    resetProgress();
+    setPhase(conf.phase);
+    updateLiveEmpty();
+
+    try {
+      var job = await postJson(API.jobs, {
+        config: config,
+        mode: mode,
+        dry_run: mode !== 'copy'
+      });
+      state.jobId = job.job_id;
+      state.jobMode = job.mode || mode;
+      if (mode === 'scan') {
+        state.scanRequest = {
+          source_dir: config.source_dir,
+          suffixes: config.suffixes,
+          recursive: config.recursive
+        };
+      } else if (mode === 'preview') {
+        state.planRequest = buildConfig();
+      }
+      if (el.progressCard.scrollIntoView) {
+        el.progressCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+      showToast(conf.startToast, 'info');
+      connectEvents(job.job_id);
+    } catch (err) {
+      state.jobId = null;
+      setJobRunning(false);
       showToast(err.message, 'error');
     } finally {
-      setLoading(el.btnScan, false);
+      setLoading(button, false);
       renderValidation();
     }
   }
+
+  function handleScan() { return startJob('scan'); }
+
+  function handlePreview() { return startJob('preview'); }
 
   function makeChip(label, value) {
     var chip = document.createElement('span');
@@ -749,25 +948,6 @@
 
   /* ================= 预览计划 ================= */
 
-  async function handlePreview() {
-    if (el.btnPreview.disabled) { return; }
-    setLoading(el.btnPreview, true, '计算中…');
-    renderValidation({ showSummary: true });
-    try {
-      var data = await postJson(API.preview, buildConfig());
-      state.plan = data;
-      state.planRequest = buildConfig();
-      renderPlan(data);
-      updateLiveEmpty();
-      showToast('计划已生成：' + data.folder_name + '（' + formatCount(data.planned_files) + ' 个文件）', 'ok');
-    } catch (err) {
-      showToast(err.message, 'error');
-    } finally {
-      setLoading(el.btnPreview, false);
-      renderValidation();
-    }
-  }
-
   function renderPlan(data) {
     setHidden(el.planCard, false);
     setText(el.planMeta, '未写入磁盘');
@@ -789,39 +969,7 @@
 
   /* ================= 任务：开始 / 进度 / 取消 ================= */
 
-  async function handleStart() {
-    if (el.btnStart.disabled) { return; }
-    renderValidation({ showSummary: true });
-    if (Object.keys(state.errors).length > 0) { showToast('配置不完整，请先修正左侧提示', 'error'); return; }
-
-    setLoading(el.btnStart, true, '启动中…');
-    renderValidation();
-    try {
-      var job = await postJson(API.jobs, { config: buildConfig(), dry_run: false });
-      state.jobId = job.job_id;
-      state.jobRunning = true;
-      state.completing = false;
-      setHidden(el.reportCard, true);
-      setHidden(el.reportError, true);
-      setHidden(el.failuresDetails, true);
-      setHidden(el.reportNoTimeDetails, true);
-      resetProgress();
-      setPhase('planning');
-      updateActionState();
-      updateLiveEmpty();
-      if (el.progressCard.scrollIntoView) {
-        el.progressCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-      }
-      showToast('任务已启动，正在规划拷贝计划…', 'info');
-      connectEvents(job.job_id);
-    } catch (err) {
-      showToast(err.message, 'error');
-      state.jobRunning = false;
-    } finally {
-      setLoading(el.btnStart, false);
-      renderValidation();
-    }
-  }
+  function handleStart() { return startJob('copy'); }
 
   async function handleCancel() {
     if (!state.jobId || !state.jobRunning) { return; }
@@ -830,7 +978,7 @@
     try {
       var res = await postJson(API.cancel(state.jobId), { job_id: state.jobId, canceled: true });
       if (res && res.canceled === false) { showToast('任务已结束，无需取消', 'info'); }
-      else { showToast('已发送取消请求：已复制的文件会保留', 'info'); }
+      else { showToast('已发送取消请求：已完成的拷贝会保留', 'info'); }
     } catch (err) {
       showToast(err.message, 'error');
     } finally {
@@ -865,9 +1013,11 @@
       try { data = JSON.parse(event.data); } catch (err) { data = null; }
       if (!data) { return; }
       var phase = data.phase || '';
-      // 终局事件（finished / canceled / failed）不携带进度字段，直接取最终状态，避免进度被清零
-      if (TERMINAL_PHASES.indexOf(phase) >= 0) {
-        completeJob(jobId);
+      // 终局事件（finished / canceled / failed）不携带进度字段，直接取最终状态，避免进度被清零；
+      // 注意：任务在扫描途中被取消时，最后一条事件的 phase 可能仍是 scanning/copying，
+      // 但 status 已经是 canceled —— 以 status 为准，才能立刻解锁界面。
+      if (TERMINAL_PHASES.indexOf(phase) >= 0 || TERMINAL_STATUSES.indexOf(data.status) >= 0) {
+        completeJob(jobId, data);
         return;
       }
       if (hasProgressFields(data)) { renderProgress(normalizeProgress(data)); }
@@ -927,8 +1077,24 @@
   }
 
   function hasProgressFields(data) {
-    var keys = ['total_files', 'done_files', 'total_bytes', 'done_bytes', 'percent'];
+    var keys = ['total_files', 'done_files', 'total_bytes', 'done_bytes', 'percent',
+      'scanned_files', 'scan_total_files'];
     return keys.some(function (key) { return data[key] !== undefined && data[key] !== null; });
+  }
+
+  /**
+   * 合并「轮询 / SSE 终局事件快照」与「重新拉取的任务详情」：
+   * 详情里的 final progress 优先（避免进度被清零），report / status / error 缺失时用快照兜底。
+   */
+  function mergeJobState(fetched, snapshot) {
+    if (!fetched) { return snapshot || null; }
+    if (!snapshot) { return fetched; }
+    if (!fetched.report && snapshot.report) { fetched.report = snapshot.report; }
+    if (!fetched.status || fetched.status === 'running') { fetched.status = snapshot.status || fetched.status; }
+    if (fetched.error === null || fetched.error === undefined) { fetched.error = snapshot.error || null; }
+    if (!fetched.progress) { fetched.progress = snapshot.progress || null; }
+    if (!fetched.mode && snapshot.mode) { fetched.mode = snapshot.mode; }
+    return fetched;
   }
 
   async function completeJob(jobId, snapshot) {
@@ -938,39 +1104,97 @@
     stopPolling();
     setBanner(false);
 
-    var data = snapshot || null;
-    if (!data) {
-      try { data = await request(API.job(jobId)); } catch (err) { data = null; }
+    var fetched = null;
+    if (!snapshot || !snapshot.progress) {
+      try { fetched = await request(API.job(jobId)); } catch (err) { fetched = null; }
     }
+    var data = mergeJobState(fetched, snapshot);
 
-    state.jobRunning = false;
     state.completing = false;
-    updateActionState();
+    setJobRunning(false); // 任务结束：解锁配置区并恢复按钮状态
 
     if (!data) {
       setPhase('failed');
       showToast('无法读取任务最终状态，请刷新页面确认结果', 'error');
+      updateLiveEmpty();
       return;
     }
 
     renderProgress(normalizeProgress(data.progress));
-    renderReport(data);
+    renderOutcome(data);
     updateLiveEmpty();
 
     var status = data.status || '';
     if (status === 'done') {
       setPhase('finished');
-      var copied = data.report ? num(data.report.copied_files) : 0;
-      showToast('任务完成：成功复制 ' + formatCount(copied) + ' 个文件', 'ok');
+      showToast(successToast(data), 'ok');
     } else if (status === 'canceled') {
       setPhase('canceled');
-      showToast('任务已取消，已复制的文件保留', 'info');
+      showToast('任务已取消，已完成的拷贝会保留', 'info');
     } else if (status === 'failed') {
       setPhase('failed');
       showToast('任务失败：' + (data.error || '未知错误'), 'error');
     } else {
       setPhase('finished');
     }
+  }
+
+  /** 任务成功提示：按 mode 取不同措辞。 */
+  function successToast(job) {
+    var mode = jobMode(job);
+    var report = job.report || null;
+    if (mode === 'scan') {
+      var scan = pickScanReport(report);
+      if (scan) {
+        return '扫描完成：命中 ' + formatCount(scan.matched_files) + ' 个文件，配对 ' +
+          formatCount(scan.groups) + ' 张照片';
+      }
+      return '扫描完成';
+    }
+    if (mode === 'preview') {
+      var plan = report && report.plan ? report.plan : null;
+      if (plan) {
+        return '计划已生成：' + (plan.folder_name || '') + '（' + formatCount(plan.planned_files) + ' 个文件）';
+      }
+      return '计划已生成';
+    }
+    var copied = report ? num(report.copied_files) : 0;
+    return '任务完成：成功复制 ' + formatCount(copied) + ' 个文件';
+  }
+
+  /** 任务 / 报告的实际模式（报告字段优先，其次任务字段）。 */
+  function jobMode(job) {
+    var report = job && job.report ? job.report : null;
+    return (report && report.mode) || (job && job.mode) || state.jobMode || '';
+  }
+
+  /** scan 报告：新契约放在 report.scan；旧结构（扫描结果直接作为 report）也兼容。 */
+  function pickScanReport(report) {
+    if (!report || typeof report !== 'object') { return null; }
+    if (report.scan && typeof report.scan === 'object') { return report.scan; }
+    if (report.groups !== undefined && report.matched_files !== undefined) { return report; }
+    return null;
+  }
+
+  /** 按任务模式渲染结果卡片：scan → 扫描结果；preview → 计划 + 扫描结果；copy → 执行报告。 */
+  function renderOutcome(job) {
+    var mode = jobMode(job);
+    var report = job.report || null;
+    var status = job.status || '';
+    if (mode === 'scan') {
+      var scan = pickScanReport(report);
+      if (scan) { renderScan(scan); }
+      if (status === 'failed') { renderReport(job); }
+      return;
+    }
+    if (mode === 'preview') {
+      if (report && report.plan) { renderPlan(report.plan); }
+      var scanAgain = pickScanReport(report);
+      if (scanAgain) { renderScan(scanAgain); }
+      if (status === 'failed') { renderReport(job); }
+      return;
+    }
+    renderReport(job);
   }
 
   function normalizeProgress(source) {
@@ -985,6 +1209,8 @@
       phase: p.phase || source.phase || '',
       total_files: num(p.total_files),
       done_files: num(p.done_files),
+      scanned_files: num(p.scanned_files),
+      scan_total_files: num(p.scan_total_files),
       total_bytes: totalBytes,
       done_bytes: doneBytes,
       current_file: p.current_file || '',
@@ -1001,7 +1227,10 @@
     el.progressBar.setAttribute('aria-valuenow', '0');
     setText(el.progressPercent, '0.0%');
     setText(el.progressFiles, '0 / 0 个文件');
+    setText(el.progressBytesLabel, '已复制 / 总字节');
     setText(el.progressBytes, '0 B / 0 B');
+    setText(el.progressScanFiles, '0 / 0');
+    setText(el.progressScanLabel, '命中文件 / 已读 EXIF');
     setText(el.progressSpeed, '—');
     setText(el.progressEta, '—');
     setText(el.progressElapsed, '00:00');
@@ -1017,14 +1246,31 @@
     setText(el.progressPhase, PHASE_LABELS[key]);
   }
 
+  function isScanPhase(phase) { return SCAN_PHASES.indexOf(phase) >= 0; }
+
   function renderProgress(p) {
     if (!p) { resetProgress(); return; }
     var percent = clamp(num(p.percent), 0, 100);
+    var scanning = isScanPhase(p.phase);
     el.progressFill.style.width = percent.toFixed(2) + '%';
     el.progressBar.setAttribute('aria-valuenow', percent.toFixed(1));
     setText(el.progressPercent, percent.toFixed(1) + '%');
-    setText(el.progressFiles, formatCount(p.done_files) + ' / ' + formatCount(p.total_files) + ' 个文件');
-    setText(el.progressBytes, formatBytes(p.done_bytes) + ' / ' + formatBytes(p.total_bytes));
+
+    if (scanning) {
+      // 扫描 / 预览阶段：进度按「已扫描 / 待扫描」文件数展示
+      setText(el.progressFiles, '已扫描 ' + formatCount(p.scanned_files) +
+        ' / 共 ' + formatCount(p.scan_total_files) + ' 个文件');
+      setText(el.progressBytesLabel, '合计体积');
+      setText(el.progressBytes, formatBytes(p.total_bytes));
+      setText(el.progressScanLabel, '命中文件 / 已读 EXIF');
+    } else {
+      setText(el.progressFiles, formatCount(p.done_files) + ' / ' + formatCount(p.total_files) + ' 个文件');
+      setText(el.progressBytesLabel, '已复制 / 总字节');
+      setText(el.progressBytes, formatBytes(p.done_bytes) + ' / ' + formatBytes(p.total_bytes));
+      // 复制阶段这一栏显示的是「计划文件 / 已复制」，标签必须跟着换，否则会读成"已读 EXIF"
+      setText(el.progressScanLabel, '计划文件 / 已复制');
+    }
+    setText(el.progressScanFiles, formatCount(p.total_files) + ' / ' + formatCount(p.done_files));
     setText(el.progressSpeed, formatSpeed(p.speed_bps));
     setText(el.progressEta, formatDuration(p.eta_seconds));
     setText(el.progressElapsed, formatDuration(p.elapsed_seconds));
@@ -1033,15 +1279,23 @@
       setText(el.progressCurrentName, baseName(p.current_file));
       el.progressCurrentName.title = p.current_file;
     } else {
-      setText(el.progressCurrentName, p.phase === 'planning' ? '正在规划拷贝计划…' : '等待开始');
+      setText(el.progressCurrentName, phasePlaceholder(p.phase));
       el.progressCurrentName.title = '';
     }
 
     setHint(el.progressMessage, p.message);
     if (p.phase) { setPhase(p.phase); }
-    document.title = (p.phase === 'copying' || p.phase === 'planning')
+    document.title = (isScanPhase(p.phase) || p.phase === 'copying' || p.phase === 'planning')
       ? (percent.toFixed(1) + '% · ' + BASE_TITLE)
       : BASE_TITLE;
+  }
+
+  function phasePlaceholder(phase) {
+    if (phase === 'counting') { return '正在统计待扫描文件…'; }
+    if (phase === 'scanning') { return '正在扫描文件并读取 EXIF 拍摄时间…'; }
+    if (phase === 'planning') { return '正在规划拷贝计划…'; }
+    if (phase === 'copying') { return '正在复制…'; }
+    return '等待开始';
   }
 
   /* ================= 报告 ================= */
@@ -1276,6 +1530,10 @@
     el.browserBackdrop.addEventListener('click', closeBrowser);
     el.browserSelect.addEventListener('click', confirmBrowser);
     el.browserGo.addEventListener('click', function () { loadBrowse(el.browserPath.value.trim()); });
+    el.browserMkdir.addEventListener('click', handleMkdir);
+    el.browserNewName.addEventListener('keydown', function (event) {
+      if (event.key === 'Enter') { event.preventDefault(); handleMkdir(); }
+    });
     el.browserPath.addEventListener('keydown', function (event) {
       if (event.key === 'Enter') { event.preventDefault(); loadBrowse(el.browserPath.value.trim()); }
     });
@@ -1297,6 +1555,7 @@
   async function init() {
     cacheEls();
     setText(el.footerOrigin, ORIGIN);
+    setConfigLocked(false);
     bindEvents();
     resetProgress();
     updateLiveEmpty();

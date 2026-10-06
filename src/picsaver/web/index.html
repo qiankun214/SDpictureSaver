@@ -57,6 +57,9 @@
 
         <div class="card__body">
 
+          <!-- 配置区：任务运行期间整块锁定（fieldset.disabled） -->
+          <fieldset class="config-fields" id="config-fields">
+
           <div class="field">
             <label class="field__label" for="source-dir">源目录（SD 卡 / 相机存储卡）<span class="field__required">必填</span></label>
             <div class="field__row">
@@ -145,6 +148,18 @@
             <p class="hint hint--error" id="folder-error" hidden></p>
           </div>
 
+          </fieldset>
+
+          <p class="config-lock" id="config-lock-notice" hidden>
+            <span class="config-lock__icon" aria-hidden="true">
+              <svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="4.5" y="8.8" width="11" height="7.7" rx="2"></rect>
+                <path d="M7 8.8V6.9a3 3 0 0 1 6 0v1.9"></path>
+              </svg>
+            </span>
+            <span class="config-lock__text">任务进行中，配置已锁定（如需修改请先「取消任务」或等待任务结束）</span>
+          </p>
+
           <p class="hint hint--error actions__error" id="form-error" hidden></p>
 
           <div class="actions" id="actions">
@@ -179,8 +194,12 @@
             </div>
             <div class="progress__stats">
               <div class="stat">
-                <span class="stat__label">已复制 / 总字节</span>
+                <span class="stat__label" id="progress-bytes-label">已复制 / 总字节</span>
                 <span class="stat__value stat__value--mono" id="progress-bytes">0 B / 0 B</span>
+              </div>
+              <div class="stat">
+                <span class="stat__label" id="progress-scan-label">命中文件 / 已读 EXIF</span>
+                <span class="stat__value stat__value--mono" id="progress-scan-files">0 / 0</span>
               </div>
               <div class="stat">
                 <span class="stat__label">速度</span>
@@ -379,6 +398,14 @@
       <button class="btn btn--sm" type="button" id="browser-go">转到</button>
     </div>
     <p class="hint hint--error" id="browser-error" hidden></p>
+    <p class="hint" id="browser-meta" hidden></p>
+    <div class="browser-new">
+      <span class="browser-new__label">新建文件夹</span>
+      <input class="input" type="text" id="browser-new-name" spellcheck="false" autocomplete="off" placeholder="当前目录下新建，例如 2026北海道">
+      <button class="btn btn--sm" type="button" id="browser-mkdir">创建</button>
+    </div>
+    <p class="hint" id="browser-new-hint">在当前目录下新建子文件夹；创建成功后自动进入该目录。名称不能包含 &lt; &gt; : " / \ | ? *，首尾不能是空格或点。</p>
+    <p class="hint hint--error" id="browser-new-error" hidden></p>
     <div class="browser-body">
       <div class="browser-drives" id="browser-drives"></div>
       <ul class="browser-list" id="browser-list"></ul>
