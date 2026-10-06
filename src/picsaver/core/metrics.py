@@ -10,10 +10,11 @@ class SpeedMeter:
     """基于滑动窗口的瞬时速度与 ETA 估算器。
 
     :param window_seconds: 参与计算的最近时间窗口（秒）
-    :param min_span: 计算速度所需的最小时间跨度（秒），避免早期抖动
+    :param min_span: 计算速度所需的最小时间跨度（秒），避免早期抖动；取小一点可以让
+        本地高速拷贝也能尽快显示速度与 ETA
     """
 
-    def __init__(self, window_seconds: float = 6.0, min_span: float = 0.35) -> None:
+    def __init__(self, window_seconds: float = 5.0, min_span: float = 0.2) -> None:
         self.window_seconds = float(window_seconds)
         self.min_span = float(min_span)
         self._samples: deque[tuple[float, float]] = deque()

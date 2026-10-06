@@ -86,11 +86,13 @@
 
 | 决策点 | 结论 |
 | --- | --- |
-| 第三方库 | **复用本机已安装库**：ExifRead 3.3.0（EXIF 主解析，JPG/ARW/ORF 通用）、Pillow 9.3.0（JPG 兜底）、rawpy 0.24.0（RAW 兜底）、FastAPI 0.103.2 + uvicorn 0.23.2 + sse-starlette 1.6.5（后端与真实进度推送）、typer 0.9.0 + click（CLI）、tqdm（CLI 进度）、pytest（测试，清华镜像安装） |
+| 第三方库 | **复用本机已安装库**：ExifRead 3.3.0（EXIF 主解析，JPG/ARW/ORF 通用）、Pillow 9.3.0（JPG 兜底）、FastAPI 0.103.2 + uvicorn 0.23.2 + sse-starlette 1.6.5（后端与真实进度推送）、typer 0.9.0 + click（CLI）、tqdm（CLI 进度）、pytest 9.1.1（测试，已用清华镜像安装） |
+| RAW 时间兜底 | 实测本机 **rawpy 0.24.0 的 `RawPy` 没有 `metadata` / `timestamp` 接口**（`dir(RawPy)` 验证），无法取拍摄时间，故**不使用 rawpy**；改为在 `core/exif_time.py` 内置一个纯标准库的极简 TIFF/EXIF 读取器（解析 IFD0 + Exif 子 IFD 的 0x0132 / 0x9003 / 0x9004），作为 ExifRead、Pillow 之后的第三道兜底 |
 | 界面形态 | **Web 前端**（浏览器访问，FastAPI 提供 REST + SSE 进度）**并且**提供 **CLI**；两者共用 core |
 | 无 EXIF 时间 | **跳过该文件并在报告中列出** |
 | 源文件处理 | **一律复制**，绝不移动 / 删除源文件（不提供 move 模式） |
 | JPG/RAW 同名配对 | **严格只拷用户勾选的后缀**；同名的 jpg/raw（同目录同主文件名）**共用同一拍摄时间**用于日期范围判定 |
+| 前端技术 | 原生 HTML/CSS/JS，**无构建步骤、无 npm、无 CDN**（离线可用），由后端 `/static` 托管 |
 | 现有开源方案 | 已调研 [SortPhotos](https://github.com/andrewning/sortphotos)：仅为固定命名模板的 CLI，无 `[日期]地点-备注` 命名、无地点/备注输入、无界面与真实进度，故不直接采用，仅作参考 |
 
 ## 9. 目录结构约定
@@ -118,3 +120,5 @@ pictureSaver2/
 - 进度回调统一使用 `core` 定义的事件模型，后端与 CLI 各自渲染，不得在 core 里做展示格式化。
 - 复制过程要防重名、防半截文件：先写临时文件再改名，目标文件已存在同名同大小视为已存在。
 - 一切验证以"实际运行 + pytest"为准，不靠口头声称。
+- 源文件一律 UTF-8；**禁止用 PowerShell 的 `-replace` / `Set-Content` 改写源码或文档**（会把 UTF-8 变成乱码），改文件只用编辑器工具。
+- 运行 CLI / 脚本时设置 `PYTHONIOENCODING=utf-8`，避免 Windows 控制台中文乱码。

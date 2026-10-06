@@ -121,7 +121,8 @@ def copy_plan(
     copied_bytes = 0
     canceled = False
 
-    if not dry_run and prepare_target:
+    if not dry_run and prepare_target and plan.items:
+        # 只有确实有文件要处理时才创建目标目录，避免空跑留下空文件夹
         ensure_target_parent(plan.config)
         plan.target_dir.mkdir(parents=True, exist_ok=True)
 
