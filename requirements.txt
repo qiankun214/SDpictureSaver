@@ -1,0 +1,15 @@
+# pictureSaver2 运行依赖（版本与本机已验证环境一致）
+# 安装（中国大陆必须走清华镜像）：
+#   python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+ExifRead==3.3.0
+Pillow==9.3.0
+fastapi==0.103.2
+uvicorn==0.23.2
+sse-starlette==1.6.5
+pydantic==1.10.11
+typer==0.9.0
+click==8.1.6
+tqdm==4.64.1
+
+# 开发/测试依赖
+pytest>=7.4

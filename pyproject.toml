@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "picsaver"
+version = "0.1.0"
+description = "SD 卡照片按日期范围拷贝工具（jpg + raw，前后端分离）"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "ExifRead==3.3.0",
+    "Pillow==9.3.0",
+    "fastapi==0.103.2",
+    "uvicorn==0.23.2",
+    "sse-starlette==1.6.5",
+    "pydantic==1.10.11",
+    "typer==0.9.0",
+    "click==8.1.6",
+    "tqdm==4.64.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+picsaver = "picsaver.cli.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+picsaver = ["web/*.html", "web/*.css", "web/*.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
