@@ -1,4 +1,14 @@
-"""后台任务管理：线程执行 core，把进度事件推给 SSE / 轮询接口。"""
+"""后台任务管理：线程执行 core，把进度事件推给 SSE / 轮询接口。
+
+一次任务有三种模式：
+
+- ``scan``    只扫描统计（不写盘）
+- ``preview`` 扫描 + 生成拷贝计划（不写盘）
+- ``copy``    扫描 + 计划 + 真正复制
+
+三种模式都通过同一个进度模型推送进度，因此界面可以用一条进度条显示
+"扫描进度（已扫描/共多少）"与"复制进度（字节）"。
+"""
 
 from __future__ import annotations
 
@@ -7,9 +17,18 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
-from ..core.events import PHASE_FAILED, PHASE_FINISHED, ProgressEvent
+from ..core.events import (
+    PHASE_COPYING,
+    PHASE_COUNTING,
+    PHASE_FAILED,
+    PHASE_FINISHED,
+    PHASE_PLANNING,
+    PHASE_SCANNING,
+    ProgressEvent,
+)
 from ..core.metrics import SpeedMeter
 from ..core.models import CopyConfig, CopyPlan
 from ..core.service import CopyService
@@ -18,15 +37,39 @@ from ..core.service import CopyService
 MAX_QUEUED_EVENTS = 400
 #: 结束哨兵
 END_MARKER = "__end__"
+#: 扫描类阶段（进度按文件数计算）
+SCAN_PHASES = (PHASE_COUNTING, PHASE_SCANNING, PHASE_PLANNING)
+
+
+@dataclass
+class JobSpec:
+    """一次任务的输入（与界面无关）。"""
+
+    mode: str
+    source_dir: Path
+    suffixes: tuple[str, ...]
+    recursive: bool = True
+    config: CopyConfig | None = None
+    dry_run: bool = False
+
+    def summary(self) -> dict[str, Any]:
+        """供界面展示的参数摘要。"""
+        if self.config is not None:
+            return self.config.summary()
+        return {
+            "source_dir": str(self.source_dir),
+            "suffixes": list(self.suffixes),
+            "recursive": self.recursive,
+            "mode": self.mode,
+        }
 
 
 @dataclass
 class Job:
-    """一个拷贝任务。"""
+    """一个后台任务。"""
 
     id: str
-    config: CopyConfig
-    dry_run: bool
+    spec: JobSpec
     started_at: float = field(default_factory=time.monotonic)
     cancel_event: threading.Event = field(default_factory=threading.Event)
     events: "queue.Queue[dict[str, Any]]" = field(default_factory=queue.Queue)
@@ -38,6 +81,9 @@ class Job:
     meter: SpeedMeter = field(default_factory=SpeedMeter)
     thread: threading.Thread | None = None
     finished_at: float | None = None
+    last_phase: str = ""
+    #: 扫描阶段的最后一次 (已扫描文件数, 待扫描文件数)，复制阶段继续沿用
+    last_scan: tuple[int, int] = (0, 0)
 
 
 class JobManager:
@@ -52,16 +98,18 @@ class JobManager:
 
     # ---- 生命周期 ------------------------------------------------------
 
-    def submit(self, config: CopyConfig, dry_run: bool = False) -> Job:
-        """创建并启动一个后台拷贝任务。"""
-        job = Job(id=uuid.uuid4().hex, config=config, dry_run=dry_run)
+    def submit(self, spec: JobSpec) -> Job:
+        """创建并启动一个后台任务。"""
+        job = Job(id=uuid.uuid4().hex, spec=spec)
         with self._lock:
             self._jobs[job.id] = job
             self._order.append(job.id)
             while len(self._order) > self.max_jobs:
                 stale = self._order.pop(0)
                 self._jobs.pop(stale, None)
-        job.thread = threading.Thread(target=self._worker, args=(job,), name=f"picsaver-{job.id[:8]}", daemon=True)
+        job.thread = threading.Thread(
+            target=self._worker, args=(job,), name=f"picsaver-{spec.mode}-{job.id[:8]}", daemon=True
+        )
         job.thread.start()
         return job
 
@@ -88,28 +136,50 @@ class JobManager:
 
     def build_progress(self, job: Job, event: ProgressEvent) -> dict[str, Any]:
         """把 core 的原始事件转成界面需要的进度对象（含百分比 / 速度 / ETA）。"""
-        total_bytes = event.total_bytes
-        done_bytes = min(event.done_bytes, total_bytes) if total_bytes else event.done_bytes
-        if total_bytes > 0:
-            percent = round(done_bytes / total_bytes * 100, 1)
+        phase = event.phase
+        if phase in SCAN_PHASES:
+            scan_total = event.scan_total_files
+            scanned = min(event.scanned_files, scan_total) if scan_total else event.scanned_files
+            percent = (
+                round(scanned / scan_total * 100, 1)
+                if scan_total
+                else (100.0 if phase == PHASE_PLANNING else 0.0)
+            )
+            speed = 0.0
+            eta = None
+            job.last_scan = (scanned, scan_total)
         else:
-            percent = 100.0 if event.phase in (PHASE_FINISHED, PHASE_FAILED) else 0.0
-        job.meter.update(event.done_bytes)
-        speed = job.meter.speed_bps()
-        remaining = max(0, total_bytes - event.done_bytes)
-        eta = job.meter.eta_seconds(remaining)
+            total_bytes = event.total_bytes
+            done_bytes = min(event.done_bytes, total_bytes) if total_bytes else event.done_bytes
+            percent = (
+                round(done_bytes / total_bytes * 100, 1)
+                if total_bytes
+                else (100.0 if phase in (PHASE_FINISHED, PHASE_FAILED) else 0.0)
+            )
+            if phase == PHASE_COPYING and job.last_phase != PHASE_COPYING:
+                job.meter.reset()  # 扫描阶段的采样单位与复制不同，进入复制时重新计时
+            job.meter.update(event.done_bytes)
+            speed = job.meter.speed_bps()
+            eta = job.meter.eta_seconds(max(0, total_bytes - event.done_bytes))
+            # 复制阶段的事件不带扫描字段，沿用扫描结束时的值（界面要一直显示已扫描文件数）
+            scanned = event.scanned_files or job.last_scan[0]
+            scan_total = event.scan_total_files or job.last_scan[1]
+
+        job.last_phase = phase
         return {
-            "phase": event.phase,
+            "phase": phase,
+            "message": event.message,
             "total_files": event.total_files,
             "done_files": event.done_files,
-            "total_bytes": total_bytes,
-            "done_bytes": done_bytes,
+            "scanned_files": scanned,
+            "scan_total_files": scan_total,
+            "total_bytes": event.total_bytes,
+            "done_bytes": event.done_bytes,
             "current_file": event.current_file,
             "percent": percent,
             "speed_bps": round(speed, 1),
             "eta_seconds": round(eta, 1) if eta is not None else None,
             "elapsed_seconds": round(time.monotonic() - job.started_at, 2),
-            "message": event.message,
         }
 
     def _push(self, job: Job, payload: dict[str, Any]) -> None:
@@ -126,14 +196,47 @@ class JobManager:
         return {
             "job_id": job.id,
             "status": job.status,
-            "dry_run": job.dry_run,
+            "mode": job.spec.mode,
+            "dry_run": job.spec.dry_run,
             "progress": job.progress,
             "report": job.report,
             "error": job.error,
-            "config": job.config.summary(),
+            "config": job.spec.summary(),
         }
 
     # ---- 工作线程 ------------------------------------------------------
+
+    def _execute(self, job: Job, on_progress) -> dict[str, Any]:
+        """按模式执行任务，返回报告字典。"""
+        spec = job.spec
+        if spec.mode == "scan":
+            scan = self.service.scan(
+                spec.source_dir,
+                spec.suffixes,
+                recursive=spec.recursive,
+                progress=on_progress,
+                cancel=job.cancel_event,
+            )
+            return {"mode": "scan", "dry_run": True, "canceled": scan.canceled, "scan": scan.to_dict()}
+        if spec.mode == "preview":
+            scan, plan = self.service.plan_only(
+                spec.config, progress=on_progress, cancel=job.cancel_event
+            )
+            job.plan = plan
+            return {
+                "mode": "preview",
+                "dry_run": True,
+                "canceled": scan.canceled,
+                "plan": plan.to_dict(),
+                "scan": scan.to_dict(),
+            }
+        plan, report = self.service.run(
+            spec.config, progress=on_progress, cancel=job.cancel_event, dry_run=spec.dry_run
+        )
+        job.plan = plan
+        payload = report.to_dict()
+        payload["mode"] = "copy"
+        return payload
 
     def _worker(self, job: Job) -> None:
         """后台线程：调用 core 执行任务，把每个进度事件推入队列。"""
@@ -144,12 +247,9 @@ class JobManager:
             self._push(job, payload)
 
         try:
-            plan, report = self.service.run(
-                job.config, progress=on_progress, cancel=job.cancel_event, dry_run=job.dry_run
-            )
-            job.plan = plan
-            job.report = report.to_dict()
-            job.status = "canceled" if report.canceled else "done"
+            report = self._execute(job, on_progress)
+            job.report = report
+            job.status = "canceled" if report.get("canceled") else "done"
         except Exception as exc:  # noqa: BLE001 - 失败要落回任务状态，不能杀死服务
             job.status = "failed"
             job.error = f"{type(exc).__name__}: {exc}"

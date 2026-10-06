@@ -207,6 +207,8 @@ class ScanResult:
     total_bytes: int = 0
     elapsed_seconds: float = 0.0
     no_time_files: list[NoTimeFile] = field(default_factory=list)
+    #: 扫描是否被用户取消（取消时结果不完整）
+    canceled: bool = False
 
     @property
     def with_time_files(self) -> int:
@@ -226,6 +228,7 @@ class ScanResult:
             "no_time": len(self.no_time_files),
             "no_time_files": [f.to_dict() for f in self.no_time_files],
             "elapsed_seconds": round(self.elapsed_seconds, 3),
+            "canceled": self.canceled,
         }
 
 

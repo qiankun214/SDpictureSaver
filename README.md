@@ -28,7 +28,10 @@
 | 按后缀分文件夹 | 目标目录内 `JPG\`、`ARW\`、`ORF\` … |
 | 只拷勾选后缀 | 严格按勾选后缀执行；同名配对只用于**统一时间判定** |
 | 无 EXIF 时间 | **跳过**，并在报告 / 界面中逐条列出（不猜测、不静默丢弃） |
-| 进度条 | 来自 core 的真实事件：已处理/总文件数、已复制/总字节、当前文件、速度、ETA、已用时间 |
+| 进度条 | 来自 core 的真实事件：**扫描/预览**显示"已扫描 X / 共 Y 个文件"，**复制**显示字节进度、当前文件、速度、ETA、已用时间 |
+| 目录浏览 | 浏览弹窗**只列文件夹**、不对普通文件做 stat：2 万个文件的目录实测从 ~1435 ms 降到 ~15 ms（`scripts/bench_browse.py` 可复现），超出 2000 个子目录时提示"仅显示前 2000 个" |
+| 新建文件夹 | 浏览弹窗内可直接新建文件夹（`POST /api/mkdir`），带空名/非法字符/重名/Windows 保留名校验 |
+| 任务期锁定 | 扫描 / 预览 / 拷贝进行中，配置区整体锁定（输入框、浏览按钮、后缀、日期、地点、备注都不可改），只保留「取消任务」 |
 | 安全 | 只复制；临时文件 + 改名防止半截文件；同名同大小视为已存在而跳过；重名自动加 `_1` |
 | 报告 | 成功 / 已存在跳过 / 失败明细 / 无时间跳过 / 日期范围外 / 重名改名 / 字节数 / 耗时 |
 
@@ -58,15 +61,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run_web.ps1 8765
 
 浏览器打开后：
 
-1. **源目录**：手动输入，或点【浏览…】逐级选择（支持盘符列表）
+1. **源目录**：手动输入，或点【浏览…】逐级选择（只列文件夹，大目录也是秒开；在弹窗里可以直接【新建文件夹】）
 2. **需要处理的后缀**：勾选 jpg / arw / orf（扫描后每项旁显示实际命中数量）
 3. **日期范围**：开始 / 结束日期（开始日期即目标文件夹名中的日期）
 4. **目的父文件夹**：程序会在其下新建 `[YYYYMMDD]地点-备注`
 5. **地点 / 备注**：必填，会写进目录名；非法字符会即时提示
 6. 先【预览计划】核对将创建的目标目录与文件数，再【开始拷贝】
-7. 进度条实时显示百分比、文件数、字节数、当前文件、速度与剩余时间；可随时【取消任务】
+7. 进度条实时显示进度：扫描/预览阶段是**已扫描 X / 共 Y 个文件**，复制阶段是百分比、字节数、当前文件、速度与剩余时间；可随时【取消任务】
 
 三种操作的关系：`扫描源目录` 只统计；`预览计划` 只计算不写盘；`开始拷贝` 才真正复制文件。
+**三种操作运行期间，左侧配置区会整体锁定**，结束后自动解锁，避免任务中途改参数导致结果与预期不符。
 
 ## 4. 使用：命令行
 
@@ -95,15 +99,32 @@ python -m picsaver web --host 127.0.0.1 --port 8765
 | GET | `/` | 前端页面（静态资源在 `/static`） |
 | GET | `/api/health` | 健康检查 |
 | GET | `/api/defaults` | 界面默认值（默认后缀、今天） |
-| GET | `/api/browse?path=` | 目录浏览（省略 path 列出盘符） |
-| POST | `/api/scan` | 扫描统计：`{source_dir, suffixes, recursive}` |
-| POST | `/api/preview` | 生成计划，不落盘 |
-| POST | `/api/jobs` | 创建后台任务：`{config:{...}, dry_run}` |
+| GET | `/api/browse?path=` | 目录浏览：**只列文件夹**，返回 `path/parent/dirs/truncated/total_dirs/elapsed_ms/error`（省略 path 列盘符） |
+| POST | `/api/mkdir` | 新建文件夹：`{parent, name}` → `{path, name, created}` |
+| POST | `/api/scan` | 同步扫描统计（脚本用；界面走任务模式以便显示进度） |
+| POST | `/api/preview` | 同步生成计划（脚本用） |
+| POST | `/api/jobs` | 创建后台任务：`{config:{...}, mode:"scan"\|"preview"\|"copy", dry_run}` |
 | GET | `/api/jobs/{id}` | 任务状态 / 进度 / 报告（轮询） |
 | GET | `/api/jobs/{id}/events` | **SSE 实时进度**（断线时前端自动降级为轮询） |
-| POST | `/api/jobs/{id}/cancel` | 取消任务 |
+| POST | `/api/jobs/{id}/cancel` | 取消任务（三种模式都支持） |
 
 `config` 字段：`source_dir, suffixes[], date_from, date_to, target_parent, place, note, recursive`。
+其中 `mode="scan"` 只要求 `source_dir` 与 `suffixes`（日期/地点/备注/目标目录可以是空的），
+`preview` / `copy` 则要求字段齐全，否则返回 400 与中文提示。
+`mode` 省略时按 `dry_run ? "preview" : "copy"` 处理（兼容旧调用）。
+
+进度对象（SSE 事件与轮询同构）：
+
+```json
+{"phase":"scanning","message":"正在读取拍摄时间：120/500",
+ "total_files":500,"done_files":120,"scanned_files":120,"scan_total_files":500,
+ "total_bytes":0,"done_bytes":0,"current_file":"E:\\DCIM\\DSC0001.ARW",
+ "percent":24.0,"speed_bps":0.0,"eta_seconds":null,"elapsed_seconds":3.1}
+```
+
+- `phase`：`counting` → `scanning` → `planning` → `copying` → `finished` / `canceled` / `failed`
+- 扫描阶段 `percent = scanned_files / scan_total_files`；复制阶段 `percent` 按字节计算
+- 报告按模式区分：`scan` → `{mode, canceled, scan}`；`preview` → `{mode, canceled, plan, scan}`；`copy` → CopyReport 全部字段 + `mode`
 
 ## 6. 架构
 
@@ -170,6 +191,8 @@ python scripts\verify_browser.py --base-url http://127.0.0.1:8791
 - **能重复运行吗？** 可以。已存在且大小相同的文件会记为"已存在跳过"，不会重复写入。
 - **会修改 SD 卡吗？** 不会。全程只读源目录，只做复制。
 - **速度显示 `—`？** 复制刚开始不足 0.2 秒时无法估算速度与 ETA，稍后即会出现。
+- **点【浏览…】时看着卡？** 浏览接口只列文件夹、不读文件属性；若某个目录子文件夹超过 2000 个，会提示"仅显示前 2000 个"（可用上方路径框直接输入深层路径继续进入）。
+- **任务运行时改不了参数？** 这是有意的：扫描/预览/拷贝进行中配置区会锁定，点【取消任务】或在任务结束后即可继续编辑。
 - **`.\run_web.ps1` 报"未对文件进行数字签名"？** 这是 PowerShell 执行策略的限制，用 `.\run_web.cmd`，或执行
   `powershell -NoProfile -ExecutionPolicy Bypass -File .\run_web.ps1`。
 - **目标父文件夹不能放在源目录里？** 会被拒绝，避免把刚拷贝出来的文件再次当成源文件。

@@ -4,9 +4,11 @@ from .copier import CanceledError, cleanup_temp_files, copy_plan
 from .events import (
     PHASE_CANCELED,
     PHASE_COPYING,
+    PHASE_COUNTING,
     PHASE_FAILED,
     PHASE_FINISHED,
     PHASE_PLANNING,
+    PHASE_SCANNING,
     ProgressCallback,
     ProgressEvent,
 )
@@ -51,9 +53,11 @@ __all__ = [
     "NoTimeFile",
     "PHASE_CANCELED",
     "PHASE_COPYING",
+    "PHASE_COUNTING",
     "PHASE_FAILED",
     "PHASE_FINISHED",
     "PHASE_PLANNING",
+    "PHASE_SCANNING",
     "PhotoGroup",
     "ProgressCallback",
     "ProgressEvent",

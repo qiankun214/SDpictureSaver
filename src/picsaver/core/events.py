@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 # 阶段常量
+PHASE_COUNTING = "counting"  # 统计文件数量（不读 EXIF）
+PHASE_SCANNING = "scanning"  # 逐个读取拍摄时间
 PHASE_PLANNING = "planning"
 PHASE_COPYING = "copying"
 PHASE_FINISHED = "finished"
@@ -24,6 +26,9 @@ class ProgressEvent:
     done_bytes: int = 0
     current_file: str | None = None
     message: str = ""
+    #: 扫描阶段：已读取（已判定）的文件数 / 需要读取的文件总数
+    scanned_files: int = 0
+    scan_total_files: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """转成可直接 JSON 序列化的字典。"""
@@ -35,6 +40,8 @@ class ProgressEvent:
             "done_bytes": self.done_bytes,
             "current_file": self.current_file,
             "message": self.message,
+            "scanned_files": self.scanned_files,
+            "scan_total_files": self.scan_total_files,
         }
 
 

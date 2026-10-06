@@ -126,8 +126,10 @@ def test_preview_invalid_date_range(client: TestClient, card, tmp_path) -> None:
 
 
 def test_preview_empty_place_rejected(client: TestClient, card, tmp_path) -> None:
+    """地点为空：schema 允许（扫描任务不需要），但预览/拷贝会在 to_config 阶段拒绝。"""
     response = client.post("/api/preview", json=job_payload(card, tmp_path / "out", place="   "))
-    assert response.status_code == 422
+    assert response.status_code == 400
+    assert "地点" in response.json()["detail"]
 
 
 def test_job_lifecycle_and_report(client: TestClient, card, tmp_path) -> None:
@@ -190,3 +192,86 @@ def test_jobs_list(client: TestClient, card, tmp_path) -> None:
     wait_for(client, job_id)
     payload = client.get("/api/jobs").json()
     assert any(job["job_id"] == job_id for job in payload["jobs"])
+
+
+# ---- 任务模式：scan / preview / copy ---------------------------------------
+
+
+def test_job_scan_mode(client: TestClient, card) -> None:
+    """扫描任务：只统计，不落盘，报告里带 scan 结果。"""
+    response = client.post("/api/jobs", json={"config": job_payload(card, ""), "mode": "scan"})
+    assert response.status_code == 200
+    assert response.json()["mode"] == "scan"
+
+    payload = wait_for(client, response.json()["job_id"])
+    assert payload["status"] == "done"
+    assert payload["mode"] == "scan"
+    assert payload["report"]["mode"] == "scan"
+    assert payload["report"]["canceled"] is False
+    scan = payload["report"]["scan"]
+    assert scan["matched_files"] == 7
+    assert scan["groups"] == 4
+    assert scan["no_time"] == 1
+    assert payload["progress"]["percent"] == 100.0
+
+
+def test_job_scan_mode_accepts_incomplete_form(client: TestClient, card) -> None:
+    """扫描任务只需源目录与后缀：日期 / 地点 / 备注 / 目标目录都可以是空的。"""
+    body = {
+        "source_dir": str(card),
+        "suffixes": ["jpg"],
+        "date_from": "",
+        "date_to": None,
+        "target_parent": "",
+        "place": "",
+        "note": "",
+        "recursive": True,
+    }
+    response = client.post("/api/jobs", json={"config": body, "mode": "scan"})
+    assert response.status_code == 200, response.text
+    payload = wait_for(client, response.json()["job_id"])
+    assert payload["status"] == "done"
+    assert payload["report"]["scan"]["suffix_counts"] == {"jpg": 4}
+
+
+def test_job_preview_mode(client: TestClient, card, tmp_path) -> None:
+    """预览任务：给出计划但绝不落盘。"""
+    out = tmp_path / "out-preview"
+    response = client.post("/api/jobs", json={"config": job_payload(card, out), "mode": "preview"})
+    assert response.status_code == 200
+    assert response.json()["mode"] == "preview"
+
+    payload = wait_for(client, response.json()["job_id"])
+    assert payload["status"] == "done"
+    assert payload["report"]["mode"] == "preview"
+    assert payload["report"]["plan"]["folder_name"] == "[20260704]北海道-家庭旅行"
+    assert payload["report"]["plan"]["planned_files"] == 4
+    assert payload["report"]["scan"]["matched_files"] == 7
+    assert payload["progress"]["percent"] == 100.0
+    assert not out.exists()
+
+
+def test_job_preview_requires_full_config(client: TestClient, card, tmp_path) -> None:
+    response = client.post(
+        "/api/jobs",
+        json={"config": job_payload(card, tmp_path / "out", place=""), "mode": "preview"},
+    )
+    assert response.status_code == 400
+    assert "地点" in response.json()["detail"]
+
+
+def test_job_invalid_mode_rejected(client: TestClient, card) -> None:
+    response = client.post("/api/jobs", json={"config": job_payload(card, ""), "mode": "move"})
+    assert response.status_code == 422
+
+
+def test_job_copy_mode_progress_has_scan_fields(client: TestClient, card, tmp_path) -> None:
+    """复制任务的进度里保留扫描阶段的字段（界面要显示已扫描文件数）。"""
+    response = client.post("/api/jobs", json={"config": job_payload(card, tmp_path / "out-scan-fields"), "mode": "copy"})
+    job_id = response.json()["job_id"]
+    payload = wait_for(client, job_id)
+    progress = payload["progress"]
+    assert progress["scan_total_files"] == 7
+    assert progress["scanned_files"] == 7
+    assert progress["phase"] == "finished"
+    assert progress["percent"] == 100.0

@@ -89,3 +89,45 @@ def test_scan_missing_dir(tmp_path) -> None:
 
     with pytest.raises(FileNotFoundError):
         scan_directory(tmp_path / "nope", ["jpg"])
+
+
+def test_scan_reports_progress(tmp_path) -> None:
+    """扫描要依次回报 counting / scanning 两个阶段，并给出总数与已扫描数。"""
+    card = build_card(tmp_path / "card")
+    events = []
+    result = scan_directory(card, ["jpg", "arw", "orf"], progress=events.append)
+
+    phases = [event.phase for event in events]
+    assert phases[0] == "counting"
+    assert "scanning" in phases
+
+    scanning = [event for event in events if event.phase == "scanning"]
+    assert all(event.scan_total_files == result.matched_files for event in scanning)
+    assert scanning[-1].scanned_files == result.matched_files
+    assert scanning[-1].done_files == result.matched_files
+    scanned_series = [event.scanned_files for event in scanning]
+    assert scanned_series == sorted(scanned_series)
+    # 进度必须真的动起来（不是一直 0 也不是一开始就 100%）
+    assert scanning[0].scanned_files < scanning[-1].scanned_files
+
+
+def test_scan_can_be_canceled(tmp_path) -> None:
+    """取消扫描：尽快停下并标记 canceled，不抛异常。"""
+    import threading
+
+    card = tmp_path / "card"
+    for index in range(30):
+        make_pair(card, f"DSC{index:05d}", datetime(2026, 7, 4, 10, 0, index % 60), suffixes=("jpg", "arw"))
+
+    cancel = threading.Event()
+    seen = {"events": 0}
+
+    def on_progress(event) -> None:
+        seen["events"] += 1
+        if event.phase == "scanning" and event.scanned_files >= 1:
+            cancel.set()
+
+    result = scan_directory(card, ["jpg", "arw"], progress=on_progress, cancel=cancel)
+    assert result.canceled is True
+    assert result.matched_files == 60  # 统计阶段已经完成
+    assert seen["events"] >= 2

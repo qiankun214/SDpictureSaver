@@ -70,9 +70,16 @@ def test_full_flow(tmp_path) -> None:
     assert (card / "DCIM" / "100MSDCF" / "DSC00001.arw").exists()
     assert (card / "DCIM" / "100MSDCF" / "DSC00001.jpg").exists()
 
-    # 进度事件完整且真实
-    assert events[0].phase == "planning"
+    # 进度事件完整且真实：统计 -> 读取时间 -> 生成计划 -> 复制 -> 完成
+    phases = [event.phase for event in events]
+    assert phases[0] == "counting"
+    assert "scanning" in phases
+    assert "planning" in phases
+    assert "copying" in phases
     assert events[-1].phase == "finished"
+    scanning = [event for event in events if event.phase == "scanning"]
+    assert scanning[-1].scan_total_files == 9  # 卡上命中的 jpg/arw/orf 共 9 个
+    assert scanning[-1].scanned_files == 9
     assert events[-1].done_files == 6
     assert events[-1].done_bytes == plan.planned_bytes
     assert any(event.message for event in events)
