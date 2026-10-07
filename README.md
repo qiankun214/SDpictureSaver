@@ -3,9 +3,14 @@
 把 SD 卡（相机存储卡）里**指定日期范围内的照片**，按 `jpg + raw` 成对结构拷贝到
 `[日期]地点-备注` 目录，并在其内部**按后缀分子文件夹**存放。源文件只读，绝不移动或删除。
 
+- **桌面端**：双击 `pictureSaver2.exe` 打开原生窗口，窗口里就是同一套 Web 界面（QtWebEngine），关闭窗口即退出
 - **Web 界面**：选择日期范围 / 源目录 / 后缀 / 目的父目录 / 地点 / 备注，**进度条显示真实进度**（字节级）
-- **命令行**：`picsaver scan` / `picsaver copy` / `picsaver web`，带 tqdm 进度条
-- **前后端分离**：`core`（纯业务内核）← `api`（FastAPI）/ `cli`，后续可平滑扩展桌面 UI
+- **命令行**：`picsaver scan` / `picsaver copy` / `picsaver web` / `picsaver desktop`，带 tqdm 进度条
+- **前后端分离**：`core`（纯业务内核）← `api`（FastAPI）/ `cli` / `desktop`（桌面外壳），三层共用同一套 core 与同一套 Web 界面
+
+桌面窗口的实际样子（QtWebEngine 真实窗口，CDP 抓图）：
+
+![桌面端窗口：同一套 Web 界面](docs/screenshots/09-desktop-window.png)
 
 界面与产出的实际效果（无头 Edge 真实浏览器实跑截图，608 个文件 / 600 MB 素材）：
 
@@ -46,19 +51,24 @@
 | 串行队列 | 所有任务（前台 + 后台）走同一条队列，**任一时刻只执行一个**（前台任务插到等待列表最前面）；后续任务显示「排队中 · 前面还有 N 个」 |
 | 安全 | 只复制；临时文件 + 改名防止半截文件；同名同大小视为已存在而跳过；重名自动加 `_1` |
 | 报告 | 成功 / 已存在跳过 / 失败明细 / 无时间跳过 / 日期范围外 / 重名改名 / 字节数 / 耗时 |
+| 桌面端 | QtWebEngine 原生窗口承载**同一套 Web 界面**，可打包为**单文件 exe**；关闭窗口即退出，有任务在跑会二次确认 |
 
 ## 2. 环境与安装
 
 - Python **3.10+**（本机验证版本 3.10.11），Windows
-- 依赖（版本为本机已验证组合）：ExifRead、Pillow、fastapi、uvicorn、sse-starlette、pydantic 1.x、typer、click、tqdm；测试用 pytest
+- 运行依赖（版本为本机已验证组合）：ExifRead、Pillow、fastapi、uvicorn、sse-starlette、pydantic 1.x、typer、click、tqdm；测试用 pytest
+- 桌面端额外需要 **PySide6**（QtWebEngine，本机已装 6.9.0）；打包额外需要 **PyInstaller**（仅构建期）
 
 ```powershell
 # 中国大陆：必须使用清华镜像
 python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 需要桌面端 / 打包时（PySide6 + PyInstaller）
+python -m pip install -r requirements-desktop.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
 > 仓库根目录的 `pip.conf` 是项目级镜像配置示例。
-> 本项目**不需要安装**即可运行（`run_web.cmd` / `run_web.ps1` 会自动把 `src` 加入 `PYTHONPATH`）；
+> 本项目**不需要安装**即可运行（`run_web.cmd` / `run_desktop.cmd` 会自动把 `src` 加入 `PYTHONPATH`）；
 > 也可以 `python -m pip install -e . -i https://pypi.tuna.tsinghua.edu.cn/simple` 安装成 `picsaver` 命令。
 
 ## 3. 使用：Web 界面（推荐）
@@ -93,7 +103,41 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run_web.ps1 8765
 - 刷新页面后，排队中 / 运行中的任务会自动恢复显示
 - 同一目标目录的第二个**拷贝**任务会被拒绝并提示（避免两个任务写同一批文件）
 
-## 4. 使用：命令行
+## 4. 使用：桌面端（双击即用 / 打包 exe）
+
+桌面端是**同一个程序的外壳**：起一个本地服务，再用 QtWebEngine 原生窗口加载**同一套 Web 界面**，
+所以功能、界面、进度显示与浏览器模式完全一致，不需要两边分别维护。
+
+```powershell
+# 开发/本机运行（需要 PySide6）
+.\run_desktop.cmd              # 默认端口 8765，被占用时自动换空闲端口
+.\run_desktop.cmd 9000         # 指定首选端口
+python -m picsaver desktop     # 等价写法
+picsaver desktop --smoke       # 只自检服务与静态资源，不开窗口（打包验证用）
+```
+
+**打包成单个 exe**：
+
+```powershell
+.\build_desktop.ps1            # 默认 onefile -> dist\pictureSaver2.exe（约 200-300 MB）
+.\build_desktop.ps1 -OneDir    # 备选：目录版 dist\pictureSaver2\pictureSaver2.exe（启动更快、杀软误报更少）
+```
+
+打包脚本会自动用清华镜像安装 PyInstaller（构建期依赖）。产物在 `dist/`（已在 `.gitignore` 中，不入库）。
+
+**桌面端行为约定**
+
+| 行为 | 说明 |
+| --- | --- |
+| 关闭窗口 | 直接退出程序，本地服务随之停止 |
+| 有任务在跑时关闭 | 先弹确认框（说明已复制的文件会保留、不会留下半截文件），确认后先请求取消再退出 |
+| 重复双击 | 只保留一个服务实例；第二次会打开一个指向已有服务的窗口（关闭它不会影响已有服务） |
+| 端口占用 | 8765 被占用时自动改用系统分配的空闲端口 |
+| 窗口不可用 | 若 QtWebEngine 起不来，自动改用系统默认浏览器打开，并给出日志路径 |
+| 日志 | `%LOCALAPPDATA%\pictureSaver2\desktop.log`（窗口模式没有控制台，排错看这里） |
+| 自检 | `pictureSaver2.exe --smoke` 会写 `%TEMP%\picsaver2-smoke.json` 并在成功时返回 0 |
+
+## 5. 使用：命令行
 
 ```powershell
 # 只扫描统计
@@ -113,7 +157,7 @@ python -m picsaver web --host 127.0.0.1 --port 8765
 
 未安装包时请先设置 `$env:PYTHONPATH='src'`，或使用 `run_web.ps1`。
 
-## 5. HTTP 接口（前后端分离的契约）
+## 6. HTTP 接口（前后端分离的契约）
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -158,13 +202,13 @@ python -m picsaver web --host 127.0.0.1 --port 8765
 - `queued` 不是终局：`status ∈ {queued, running}` 表示任务还没结束
 - 报告按模式区分：`scan` → `{mode, canceled, scan}`；`preview` → `{mode, canceled, plan, scan}`；`copy` → CopyReport 全部字段 + `mode`
 
-## 6. 架构
+## 7. 架构
 
 ```
 浏览器(前端)  --HTTP/SSE-->  api (FastAPI)  --+
                                               +--> core (纯内核，无界面依赖)
 CLI (typer)  ---------------------------------+
-（未来的桌面 UI）-----------------------------+
+桌面端(QtWebEngine 窗口) --HTTP/SSE ----------+   ← 加载的就是同一套前端
 ```
 
 ```
@@ -179,15 +223,22 @@ src/picsaver/
 │  ├─ events.py     #   进度事件模型
 │  └─ service.py    #   门面：scan / preview / run
 ├─ api/             # FastAPI 后端：参数校验 + 任务编排 + SSE
-├─ cli/             # 命令行：scan / copy / web（tqdm 进度条）
+├─ cli/             # 命令行：scan / copy / web / desktop（tqdm 进度条）
+├─ desktop/         # 桌面外壳：单实例锁 + 起服务 + QtWebEngine 窗口 + 退出清理
+│  ├─ server.py     #   服务引导（不依赖 Qt，可单测；含端口回退、任务查询/取消）
+│  ├─ instance.py   #   单实例锁与 instance.json
+│  ├─ window.py     #   Qt 窗口（Qt 只在函数内延迟导入）
+│  ├─ smoke.py      #   --smoke 自检（不开窗口，供打包验证）
+│  ├─ main.py       #   编排：单实例 → 服务 → 窗口 → 清理
+│  └─ icon.ico      #   窗口 / exe 图标（scripts/make_icon.py 生成）
 └─ web/             # 原生 HTML/CSS/JS 前端（无构建、无 CDN，离线可用）
 ```
 
-## 7. 测试与验证
+## 8. 测试与验证
 
 ```powershell
 $env:PYTHONIOENCODING='utf-8'
-python -m pytest -q          # 56 项单元/接口/端到端测试
+python -m pytest -q          # 103 项单元 / 接口 / 端到端 / 桌面用例
 ```
 
 测试素材全部为**合成文件**（`tests/fixtures.py` 生成带真实 EXIF 结构的 JPG 与 TIFF 系 ARW/ORF），
@@ -204,6 +255,9 @@ python -m pytest -q          # 56 项单元/接口/端到端测试
    **刷新页面自动恢复进行中的任务**（见截图 08），全程无 JS 错误
 4. 目录浏览性能基线可复现：`python scripts\bench_browse.py`（20000 文件：旧实现 ~1435 ms → 新实现 ~15 ms）
 5. CLI 四种用法（scan / dry-run / 真实拷贝 / web）实跑通过，扫描与复制都有 tqdm 进度条
+6. **桌面端**：`pytest` 新增 13 项（端口回退、服务引导与静态资源、健康检查超时、单实例锁、`--smoke` 报告、CLI 注册、Qt 延迟导入约定）；
+   源码运行与**打包后的 exe** 都用 CDP 连上真实窗口验证（窗口标题、界面已连上后端、后台任务中心已渲染、窗口内可直接调接口）并截图；
+   `dist\pictureSaver2.exe --smoke` 返回 `ok: true`
 
 ### 复现浏览器验证
 
@@ -226,7 +280,24 @@ python scripts\verify_background.py --base-url http://127.0.0.1:8791
 
 > 两个脚本都要求后端是**刚启动的干净实例**（任务列表为空），否则恢复出来的历史任务会干扰断言。
 
-## 8. 常见问题
+### 复现桌面端验证
+
+```powershell
+# 1) 源码运行的窗口（自己拉起窗口 + 用 CDP 检查页面并截图）
+$env:PYTHONIOENCODING='utf-8'
+python scripts\verify_desktop.py --launch-module --app-port 8796 --cdp-port 9222
+
+# 2) 打包后的 exe：先自检（不开窗口），再验证真实窗口
+.\build_desktop.ps1                                  # 产出 dist\pictureSaver2.exe
+Start-Process dist\pictureSaver2.exe -ArgumentList '--smoke','--port','8797' -Wait
+Get-Content "$env:TEMP\picsaver2-smoke.json"         # {"ok": true, ...}
+python scripts\verify_desktop.py --launch-exe dist\pictureSaver2.exe --app-port 8797 --cdp-port 9223
+```
+
+> 桌面窗口（QtWebEngine/Chromium）**必须在非受限会话里运行**：受限沙箱会拦截 Chromium 的命名管道
+> （实测报 `named-platform-channel-pipe ... 拒绝访问 0x5` 并直接崩溃）。`--smoke` 不开窗口，不受影响。
+
+## 9. 常见问题
 
 - **无 EXIF 时间的照片怎么办？** 会被跳过并列出。想一并归档时，可先用相机/软件写入拍摄时间，或单独手动处理这些文件。
 - **同名文件来自不同子目录？** 目标内自动加 `_1`、`_2`，并在报告中记为"重名改名"。
@@ -242,6 +313,13 @@ python scripts\verify_background.py --base-url http://127.0.0.1:8791
 - **任务运行时改不了参数？** 这是有意的：扫描/预览/拷贝进行中配置区会锁定，点【取消任务】或在任务结束后即可继续编辑。
 - **`.\run_web.ps1` 报"未对文件进行数字签名"？** 这是 PowerShell 执行策略的限制，用 `.\run_web.cmd`，或执行
   `powershell -NoProfile -ExecutionPolicy Bypass -File .\run_web.ps1`。
+- **双击 exe 启动慢？** onefile 每次启动都要把内容解压到临时目录（首次可能 5-10 秒）。想要更快就用
+  `.\build_desktop.ps1 -OneDir` 生成目录版。
+- **杀软对 exe 报毒？** onefile 的自解压行为常被启发式误报；可用 `-OneDir` 构建，或把 exe 加入白名单。
+- **桌面窗口打不开 / 白屏？** 先看 `%LOCALAPPDATA%\pictureSaver2\desktop.log`，再用 `pictureSaver2.exe --smoke`
+  确认后端与静态资源是否正常（结果写在 `%TEMP%\picsaver2-smoke.json`）。
+- **怎么用命令行的桌面入口调试？** `python -m picsaver desktop --cdp-port 9222` 会打开窗口的 Chromium 调试端口，
+  配合 `python scripts\verify_desktop.py --cdp-port 9222` 可以检查页面并截图。
 - **目标父文件夹不能放在源目录里？** 会被拒绝，避免把刚拷贝出来的文件再次当成源文件。
 
 ---

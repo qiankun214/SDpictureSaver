@@ -230,6 +230,29 @@ def web_command(
     uvicorn.run(fastapi_app, host=host, port=port, log_level="info")
 
 
+@app.command("desktop")
+def desktop_command(
+    host: str = typer.Option("127.0.0.1", "--host", help="监听地址"),
+    port: int = typer.Option(8765, "--port", help="首选端口（被占用时自动改用空闲端口）"),
+    smoke: bool = typer.Option(False, "--smoke", help="只自检服务与静态资源，不开窗口（打包验证用）"),
+    cdp_port: int = typer.Option(None, "--cdp-port", help="窗口的 Chromium 调试端口（自动化验证用）"),
+    browser_fallback: bool = typer.Option(
+        True, "--browser-fallback/--no-browser-fallback", help="窗口不可用时是否自动改用系统浏览器"
+    ),
+) -> None:
+    """启动桌面端（QtWebEngine 窗口直接承载现有 Web 界面）。"""
+    from ..desktop.main import run_desktop
+
+    code = run_desktop(
+        host=host,
+        port=port,
+        smoke=smoke,
+        cdp_port=cdp_port,
+        browser_fallback=browser_fallback,
+    )
+    raise typer.Exit(code=code)
+
+
 @app.command("version")
 def version_command() -> None:
     """显示版本号。"""

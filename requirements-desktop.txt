@@ -1,0 +1,7 @@
+# 桌面端依赖（构建/运行桌面窗口所需）
+# 安装（中国大陆必须走清华镜像）：
+#   python -m pip install -r requirements-desktop.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+PySide6>=6.6
+
+# 打包（构建期依赖，不随应用分发）
+pyinstaller>=6.0

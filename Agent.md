@@ -32,12 +32,14 @@
 - 依赖方向固定，禁止反向依赖：
   ```
   前端(浏览器) --HTTP/SSE--> api 后端 --+
-                                      +--> core
+                                       +--> core
   CLI ------------------------------- +--> core
-  （未来桌面 UI）--------------------- +
+  桌面端(QtWebEngine 窗口) --HTTP/SSE -+--> core（经由 api）
   ```
 - `core` 只暴露与界面无关的 API（数据模型 + 服务对象 + 进度回调），因此后续可平滑扩展 `UI -> core`、`CLI -> core`。
 - 后端只做参数校验、任务编排、进度推送；所有文件系统逻辑必须落在 `core`，CLI 与 API 共享同一套 core 实现，不得各写一份。
+- **桌面端只是外壳**：`picsaver.desktop` 负责"起本地服务 + 开窗口 + 退出清理"，窗口加载的就是同一套 Web 界面，
+  禁止在桌面层复制业务逻辑或另写一套前端（详见第 7 节）。
 
 ## 5. 版本管理
 
@@ -89,6 +91,15 @@
 - **所有正在进行的任务都要能看到真实进度**（后台任务卡同样显示扫描/复制进度）。
 - 任务结束后卡片显示结果摘要，用户可点 **× 关闭**不再显示；并支持「清除已完成」批量关闭；刷新页面后，排队中/运行中的任务自动恢复显示。
 
+### 桌面端入口（双击即用）
+
+- 必须提供桌面入口：命令 `picsaver desktop`（及 `python -m picsaver.desktop`、`run_desktop.cmd`），
+  用 **PySide6 QtWebEngine 原生窗口**承载**同一套 Web 界面**（`http://127.0.0.1:<port>/`），不得另写前端。
+- 桌面层职责仅限：单实例检测、启动/停止本地服务、开窗口、退出清理、窗口图标与标题；不得包含业务逻辑。
+- 关闭窗口 = 退出程序；若仍有排队中/运行中的任务，必须先弹确认框，确认后先请求取消再退出。
+- 必须能打包为**单文件 exe**（PyInstaller onefile，`build_desktop.ps1` → `dist\pictureSaver2.exe`），
+  且提供一个不依赖图形界面的自检模式（`--smoke`）用于打包验证。
+
 ## 8. 已确认的技术决策（用户确认，2026-10-06）
 
 | 决策点 | 结论 |
@@ -100,6 +111,7 @@
 | 源文件处理 | **一律复制**，绝不移动 / 删除源文件（不提供 move 模式） |
 | JPG/RAW 同名配对 | **严格只拷用户勾选的后缀**；同名的 jpg/raw（同目录同主文件名）**共用同一拍摄时间**用于日期范围判定 |
 | 前端技术 | 原生 HTML/CSS/JS，**无构建步骤、无 npm、无 CDN**（离线可用），由后端 `/static` 托管 |
+| 桌面端（2026-10-07） | 用户选择 **PySide6 + QtWebEngine 原生窗口**（本机已装，**零新增运行时依赖**；`QtWebEngineWidgets` 实测可用）+ **PyInstaller 单文件**打包（构建期依赖，清华镜像安装）。窗口只做外壳，加载同一套 Web 界面 |
 | 现有开源方案 | 已调研 [SortPhotos](https://github.com/andrewning/sortphotos)：仅为固定命名模板的 CLI，无 `[日期]地点-备注` 命名、无地点/备注输入、无界面与真实进度，故不直接采用，仅作参考 |
 
 ## 9. 目录结构约定
@@ -113,12 +125,16 @@ pictureSaver2/
 ├─ pip.conf                # 清华镜像固定配置
 ├─ run_web.cmd             # 一键启动 Web 界面（推荐：批处理不受 PowerShell 执行策略限制）
 ├─ run_web.ps1             # 同上（PowerShell 版，纯 ASCII 输出，兼容 PowerShell 5.1）
-├─ scripts/                # 可复现的验证脚本（如无头浏览器端到端验证）
+├─ run_desktop.cmd         # 一键启动桌面端（QtWebEngine 原生窗口）
+├─ build_desktop.ps1       # 打包桌面端（PyInstaller；纯 ASCII 输出）
+├─ packaging/              # PyInstaller 配置（picsaver-desktop.spec）
+├─ scripts/                # 可复现的验证脚本（无头浏览器 / 桌面窗口 / 图标生成）
 ├─ src/picsaver/
 │  ├─ core/                # 纯内核：不依赖 UI / Web / CLI
 │  ├─ api/                 # FastAPI 后端（调用 core）
 │  ├─ cli/                 # 命令行入口（调用 core）
-│  └─ web/                 # 前端静态资源（HTML/CSS/JS，无构建步骤）
+│  ├─ desktop/             # 桌面外壳：起服务 + QtWebEngine 窗口 + 退出清理
+│  └─ web/                 # 前端静态资源（HTML/CSS/JS，无构建步骤；桌面窗口也加载它）
 └─ tests/                  # pytest 测试与合成素材
 ```
 
@@ -138,4 +154,11 @@ pictureSaver2/
 - **串行执行**：所有任务共用一条队列，禁止并发执行（磁盘不会被互相拖慢，结果可预期）；任务状态必须区分 `queued` 与 `running`，`queued` 绝不是终局。
 - 多任务进度一律用 **brief 轮询**（`GET /api/jobs?brief=1`，400ms，仅在存在非终局任务时运行），不要为每个任务各开一条 SSE（HTTP/1.1 每域 6 连接会被占满）；report 正文只在任务终局时拉取一次。
 - 任务卡片的「关闭」= 前后端一起遗忘（`DELETE /api/jobs/{id}`），保证刷新后不再出现；进行中的任务只能取消、不能关闭。
+- 桌面层（`picsaver.desktop`）**不得在模块级导入 PySide6**（Qt 相关导入只放在函数内部）：
+  这样缺图形环境时 CLI/测试照常可用，`tests/test_desktop.py` 会静态检查这一约定。
+- 桌面端一切业务访问都走现有 REST 接口；`desktop/server.py` 必须保持"不依赖 Qt"，以便无窗口单测与 `--smoke` 复用。
+- 打包产物一律进 `dist/`（已在 `.gitignore`），仓库里只提交 `packaging/*.spec` 与 `build_desktop.ps1`；
+  PyInstaller 属**构建期**依赖，不写入运行依赖。
+- QtWebEngine（Chromium）**在受限沙箱内无法创建命名管道**（实测 `named-platform-channel-pipe ... 拒绝访问 0x5` 直接崩溃）：
+  桌面窗口只能在不受限会话里运行/验证，`--smoke` 模式不受影响（不开窗口）。
 - 淘汰策略只允许淘汰**终局**任务，进行中的任务永不被驱逐。

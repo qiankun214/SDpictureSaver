@@ -22,6 +22,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4"]
+# 桌面端（QtWebEngine 窗口）；打包用的 PyInstaller 只在构建期需要
+desktop = ["PySide6>=6.6"]
+build = ["pyinstaller>=6.0"]
 
 [project.scripts]
 picsaver = "picsaver.cli.main:main"
@@ -33,7 +36,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-picsaver = ["web/*.html", "web/*.css", "web/*.js"]
+picsaver = ["web/*.html", "web/*.css", "web/*.js", "desktop/*.ico"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
