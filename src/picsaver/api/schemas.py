@@ -117,12 +117,15 @@ class CopyRequest(BaseModel):
 class JobCreateRequest(BaseModel):
     """创建任务的请求。
 
-    ``mode`` 省略时按 ``dry_run ? "preview" : "copy"`` 处理（兼容旧调用）。
+    - ``mode`` 省略时按 ``dry_run ? "preview" : "copy"`` 处理（兼容旧调用）
+    - ``background=True`` 表示界面上的"后台任务"：按提交顺序 FIFO 排队；
+      默认 False 表示前台任务，会插到等待队列最前面（两者都不与正在运行的任务并发）
     """
 
     config: CopyRequest
     mode: Optional[str] = None
     dry_run: bool = False
+    background: bool = False
 
     @validator("mode")
     def _check_mode(cls, value):  # noqa: D102

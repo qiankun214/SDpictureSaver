@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 # 阶段常量
+PHASE_QUEUED = "queued"  # API 层排队中（尚未开始执行）
 PHASE_COUNTING = "counting"  # 统计文件数量（不读 EXIF）
 PHASE_SCANNING = "scanning"  # 逐个读取拍摄时间
 PHASE_PLANNING = "planning"

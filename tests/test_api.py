@@ -43,13 +43,14 @@ def job_payload(card, out, **overrides) -> dict:
 
 
 def wait_for(client: TestClient, job_id: str, timeout: float = 30.0) -> dict:
+    """等待任务真正结束（注意：``queued`` 也是未结束，不能当成完成）。"""
     deadline = time.time() + timeout
     payload: dict = {}
     while time.time() < deadline:
         response = client.get(f"/api/jobs/{job_id}")
         assert response.status_code == 200
         payload = response.json()
-        if payload["status"] != "running":
+        if payload["status"] not in ("queued", "running"):
             return payload
         time.sleep(0.05)
     raise AssertionError(f"任务超时未结束：{payload}")
@@ -192,6 +193,112 @@ def test_jobs_list(client: TestClient, card, tmp_path) -> None:
     wait_for(client, job_id)
     payload = client.get("/api/jobs").json()
     assert any(job["job_id"] == job_id for job in payload["jobs"])
+
+
+# ---- 后台任务队列：排队 / 关闭 / brief / 冲突 -------------------------------
+
+
+def make_many_pairs(card, count: int) -> None:
+    """造足够多的文件，让任务不会在 HTTP 往返之内就结束（用于并发语义测试）。"""
+    from fixtures import make_pair
+
+    for index in range(count):
+        make_pair(card / "DCIM", f"BULK{index:05d}", datetime(2026, 7, 5, 10, 0, index % 60), suffixes=("jpg", "arw"))
+
+
+def wait_all(client: TestClient, job_ids: list[str], timeout: float = 60.0) -> None:
+    for job_id in job_ids:
+        wait_for(client, job_id, timeout=timeout)
+
+
+def test_background_jobs_are_queued_not_concurrent(client: TestClient, tmp_path) -> None:
+    card = tmp_path / "card"
+    make_many_pairs(card, 40)
+    out = tmp_path / "out"
+    ids = []
+    for index in range(3):
+        response = client.post(
+            "/api/jobs",
+            json={
+                "config": job_payload(card, out, place=f"并发{index}"),
+                "mode": "copy",
+                "background": True,
+            },
+        )
+        assert response.status_code == 200, response.text
+        ids.append(response.json()["job_id"])
+
+    listed = client.get("/api/jobs", params={"brief": "1"}).json()["jobs"]
+    ours = [item for item in listed if item["job_id"] in ids]
+    active = [item for item in ours if item["status"] in ("queued", "running")]
+    running = [item for item in active if item["status"] == "running"]
+    assert len(running) <= 1, ours
+    positions = sorted(item["queue_position"] for item in active)
+    assert positions == [1, 2, 3][: len(active)], positions
+
+    wait_all(client, ids)
+    for job_id in ids:
+        payload = client.get(f"/api/jobs/{job_id}").json()
+        assert payload["status"] == "done"
+        assert payload["queue_position"] == 0
+
+
+def test_same_target_copy_is_rejected(client: TestClient, tmp_path) -> None:
+    card = tmp_path / "card"
+    make_many_pairs(card, 40)
+    out = tmp_path / "out-same"
+    config = job_payload(card, out, place="同目录")
+
+    first = client.post("/api/jobs", json={"config": config, "mode": "copy", "background": True})
+    assert first.status_code == 200, first.text
+    second = client.post("/api/jobs", json={"config": config, "mode": "copy", "background": True})
+    assert second.status_code == 409, second.text
+    assert "同一目标目录" in second.json()["detail"]
+    wait_for(client, first.json()["job_id"])
+
+
+def test_dismiss_finished_job_and_reject_active(client: TestClient, tmp_path) -> None:
+    card = tmp_path / "card"
+    make_many_pairs(card, 40)
+    out = tmp_path / "out-dismiss"
+
+    active_id = client.post(
+        "/api/jobs",
+        json={"config": job_payload(card, out, place="进行中"), "mode": "copy", "background": True},
+    ).json()["job_id"]
+    # 刚提交时还在排队/运行 -> 不允许关闭
+    blocked = client.delete(f"/api/jobs/{active_id}")
+    assert blocked.status_code == 409, blocked.text
+    assert "进行中" in blocked.json()["detail"]
+
+    wait_for(client, active_id)
+    done = client.delete(f"/api/jobs/{active_id}")
+    assert done.status_code == 200 and done.json()["dismissed"] is True
+    assert client.get(f"/api/jobs/{active_id}").status_code == 404
+    listed = client.get("/api/jobs", params={"brief": "1"}).json()["jobs"]
+    assert all(item["job_id"] != active_id for item in listed)
+    assert client.delete("/api/jobs/deadbeef").status_code == 404
+
+
+def test_jobs_brief_omits_report_body(client: TestClient, card, tmp_path) -> None:
+    response = client.post(
+        "/api/jobs",
+        json={"config": job_payload(card, tmp_path / "out-brief"), "mode": "copy", "background": True},
+    )
+    job_id = response.json()["job_id"]
+    wait_for(client, job_id)
+
+    brief_items = client.get("/api/jobs", params={"brief": "1"}).json()["jobs"]
+    brief = next(item for item in brief_items if item["job_id"] == job_id)
+    assert "report" not in brief
+    assert brief["has_report"] is True
+    assert brief["status"] == "done"
+    assert brief["age_seconds"] is not None
+    assert brief["progress"]["percent"] == 100.0
+
+    full = client.get(f"/api/jobs/{job_id}").json()
+    assert full["report"]["mode"] == "copy"
+    assert full["queue_position"] == 0
 
 
 # ---- 任务模式：scan / preview / copy ---------------------------------------

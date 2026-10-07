@@ -191,3 +191,54 @@ def test_terminal_event_always_has_terminal_phase(live_server, card) -> None:
         expected = {"done": "finished", "canceled": "canceled", "failed": "failed"}
         assert terminal, "没有收到终局事件"
         assert terminal["phase"] == expected[terminal["status"]], terminal
+
+
+def test_queued_job_streams_queue_phase_then_finishes(live_server, tmp_path) -> None:
+    """排队中的任务：SSE 先给 queued 事件，流不会被当成终局提前关闭，随后照常完成。"""
+    from fixtures import make_pair
+
+    card = tmp_path / "card"
+    for index in range(40):
+        make_pair(card / "DCIM", f"BULK{index:05d}", datetime(2026, 7, 5, 10, 0, index % 60), suffixes=("jpg", "arw"))
+
+    def payload(place: str) -> dict:
+        return {
+            "source_dir": str(card),
+            "suffixes": ["jpg", "arw"],
+            "date_from": "2026-07-04",
+            "date_to": "2026-07-06",
+            "target_parent": str(tmp_path / "out"),
+            "place": place,
+            "note": "排队",
+            "recursive": True,
+        }
+
+    with httpx.Client(base_url=live_server, timeout=120.0) as client:
+        first = client.post("/api/jobs", json={"config": payload("第一个"), "mode": "copy", "background": True}).json()
+        second = client.post("/api/jobs", json={"config": payload("第二个"), "mode": "copy", "background": True}).json()
+        assert second["status"] == "queued", second
+        assert second["queue_position"] >= 2, second
+
+        events: list[dict] = []
+        terminal: dict = {}
+        with client.stream("GET", f"/api/jobs/{second['job_id']}/events", timeout=120.0) as stream:
+            assert stream.status_code == 200
+            for line in stream.iter_lines():
+                if not line.startswith("data:"):
+                    continue
+                item = json.loads(line[5:].strip())
+                if "status" in item:
+                    terminal = item
+                    break
+                events.append(item)
+
+        assert events, "排队任务也必须能通过 SSE 收到事件"
+        assert events[0]["phase"] == "queued", events[0]
+        assert "排队中" in events[0]["message"], events[0]
+        assert any(event["phase"] == "copying" for event in events), "轮到该任务后要推送真实复制进度"
+        assert terminal["status"] == "done"
+        assert terminal["report"]["copied_files"] == 80
+
+        # 第一个任务同样正常结束
+        first_status = client.get(f"/api/jobs/{first['job_id']}").json()
+        assert first_status["status"] == "done"

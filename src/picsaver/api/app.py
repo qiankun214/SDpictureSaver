@@ -24,7 +24,7 @@ from .. import __version__
 from ..core.events import PHASE_CANCELED, PHASE_FAILED, PHASE_FINISHED
 from ..core.models import DEFAULT_SUFFIXES, ConfigError
 from ..core.service import CopyService
-from .jobs import END_MARKER, JobManager, JobSpec
+from .jobs import END_MARKER, CapacityError, JobManager, JobSpec
 from .schemas import (
     CopyRequest,
     JobCreateRequest,
@@ -220,7 +220,12 @@ def create_app() -> FastAPI:
 
     @application.post("/api/jobs")
     def create_job(request: JobCreateRequest) -> dict[str, Any]:
-        """创建后台任务（mode: scan / preview / copy）。"""
+        """创建后台任务（mode: scan / preview / copy）。
+
+        所有任务走同一条串行队列：任一时刻只有一个任务真正执行。
+        前台任务（``background=false``）插到等待队列最前面；后台任务按提交顺序 FIFO。
+        同一目标目录的第二个**拷贝**任务会被拒绝（409），避免两个任务写同一批文件。
+        """
         mode = request.resolved_mode
         source = Path(request.config.source_dir)
         suffixes = tuple(request.config.suffixes)
@@ -240,6 +245,13 @@ def create_app() -> FastAPI:
                 config.validate()
             except Exception as exc:  # noqa: BLE001
                 raise _http_error(exc) from exc
+            if mode == "copy":
+                conflict = manager.find_target_conflict(config.target_dir)
+                if conflict is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"已有任务正在处理同一目标目录：{config.target_dir}，请等待其完成后再试",
+                    )
             spec = JobSpec(
                 mode=mode,
                 source_dir=source,
@@ -248,13 +260,21 @@ def create_app() -> FastAPI:
                 config=config,
                 dry_run=bool(request.dry_run),
             )
-        job = manager.submit(spec)
-        return {"job_id": job.id, "status": job.status, "mode": spec.mode}
+        try:
+            job = manager.submit(spec, priority=not request.background)
+        except CapacityError as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+        return {
+            "job_id": job.id,
+            "status": job.status,
+            "mode": spec.mode,
+            "queue_position": manager.queue_position(job),
+        }
 
     @application.get("/api/jobs")
-    def list_jobs() -> dict[str, Any]:
-        """最近的任务列表。"""
-        return {"jobs": manager.list_jobs()}
+    def list_jobs(brief: bool = Query(default=False, description="True 时不含 report 正文，供界面轮询")) -> dict[str, Any]:
+        """最近的任务列表（最新在前）；``brief=1`` 时不返回 report 正文。"""
+        return {"jobs": manager.list_jobs(brief=brief)}
 
     @application.get("/api/jobs/{job_id}")
     def job_status(job_id: str) -> dict[str, Any]:
@@ -263,6 +283,19 @@ def create_app() -> FastAPI:
         if job is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         return manager.payload(job)
+
+    @application.delete("/api/jobs/{job_id}")
+    def dismiss_job(job_id: str) -> dict[str, Any]:
+        """关闭（遗忘）一个已结束的任务：界面上的 × 关闭。
+
+        进行中的任务不允许关闭（409），请先取消。
+        """
+        result = manager.dismiss(job_id)
+        if result == "not_found":
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if result == "active":
+            raise HTTPException(status_code=409, detail="任务还在进行中，请先取消后再关闭")
+        return {"job_id": job_id, "dismissed": True}
 
     @application.post("/api/jobs/{job_id}/cancel")
     def cancel_job(job_id: str) -> dict[str, Any]:
@@ -291,7 +324,7 @@ def create_app() -> FastAPI:
                 try:
                     item = await asyncio.to_thread(job.events.get, True, 1.0)
                 except queue.Empty:
-                    if job.status != "running":
+                    if job.status not in ("queued", "running"):
                         break
                     continue
                 if END_MARKER in item:
