@@ -8,11 +8,17 @@
  *   GET  /api/browse                  （只返回文件夹；含 truncated / total_dirs / elapsed_ms）
  *   POST /api/mkdir                   （在指定父目录下新建文件夹）
  *   POST /api/jobs                    （mode = scan | preview | copy，扫描 / 预览 / 拷贝统一走任务）
- *   GET  /api/jobs/{job_id}
- *   GET  /api/jobs/{job_id}/events    （SSE，失败时降级为 500ms 轮询）
+ *   GET  /api/jobs?brief=1            （后台任务中心轮询用，400ms 一次，不含 report 正文）
+ *   GET  /api/jobs/{job_id}           （含 report 正文）
+ *   GET  /api/jobs/{job_id}/events    （SSE，失败时降级为 500ms 轮询；仅前台任务使用）
  *   POST /api/jobs/{job_id}/cancel
+ *   DELETE /api/jobs/{job_id}         （关闭 / 遗忘任务，终局才允许，进行中返回 409）
  * 扫描与预览不再调用同步接口 POST /api/scan、POST /api/preview，以便显示真实扫描进度。
  * 进度全部来自后端真实数据，界面不做任何假动画。
+ *
+ * 后台任务中心：所有任务（前台 + 后台）在后端同一条串行队列里执行，同一时刻只有一个真正运行，
+ * 其余显示「排队中」。后台任务不锁定配置区；任务中心一律用 400ms 轮询（不为每个后台任务开 SSE，
+ * 避免占满 HTTP/1.1 每域 6 个连接）。前台任务继续使用 SSE。
  */
 'use strict';
 
@@ -28,17 +34,23 @@
     browse: '/api/browse',
     mkdir: '/api/mkdir',
     jobs: '/api/jobs',
+    jobsBrief: '/api/jobs?brief=1',
     job: function (jobId) { return '/api/jobs/' + encodeURIComponent(jobId); },
     events: function (jobId) { return '/api/jobs/' + encodeURIComponent(jobId) + '/events'; },
     cancel: function (jobId) { return '/api/jobs/' + encodeURIComponent(jobId) + '/cancel'; }
   };
 
   var POLL_INTERVAL_MS = 500;
+  //: 后台任务中心的轮询间隔（契约：400ms）
+  var TASK_POLL_MS = 400;
+  //: 刷新页面时，只恢复这段时间内完成的终局任务（秒）
+  var TASK_RESTORE_SECONDS = 600;
   var LIST_LIMIT = 500;
   var SUFFIXES = ['jpg', 'arw', 'orf'];
   var ILLEGAL_CHARS = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
   var PHASE_LABELS = {
     idle: '等待开始',
+    queued: '排队中',
     counting: '统计中',
     scanning: '扫描中',
     planning: '规划中',
@@ -57,9 +69,14 @@
   var BASE_TITLE = 'pictureSaver · 按拍摄日期拷贝照片';
   var TERMINAL_PHASES = ['finished', 'canceled', 'failed'];
   //: 终局状态（SSE 最后一条事件带 status；进度事件不带 status 字段）
+  //: 注意：queued 不是终局状态，任何判断终局的地方都不得把它算进去
   var TERMINAL_STATUSES = ['done', 'canceled', 'failed'];
+  //: 非终局状态：排队中 / 运行中
+  var ACTIVE_STATUSES = ['queued', 'running'];
   //: 扫描类阶段（进度按已扫描 / 待扫描文件数换算）
   var SCAN_PHASES = ['counting', 'scanning'];
+  //: 后台任务卡片的模式文案
+  var TASK_MODE_LABELS = { scan: '后台扫描', preview: '后台预览', copy: '后台拷贝' };
 
   /* ================= 状态 ================= */
 
@@ -76,6 +93,13 @@
     pollTimer: null,
     pollJobId: null,
     errors: {},
+    //: 后台任务中心：job_id -> task 记录
+    tasks: {},
+    //: 卡片显示顺序（等同入队顺序）
+    taskOrder: [],
+    //: 任务中心轮询定时器句柄 / 是否正在拉取（避免请求叠发）
+    taskPoller: null,
+    taskPolling: false,
     browse: { mode: 'source', seq: 0, drives: [], path: '', parent: '', busy: false }
   };
 
@@ -133,7 +157,15 @@
     el.btnScan = $('btn-scan');
     el.btnPreview = $('btn-preview');
     el.btnStart = $('btn-start');
+    el.btnBgPreview = $('btn-bg-preview');
+    el.btnBgCopy = $('btn-bg-copy');
     el.btnCancel = $('btn-cancel');
+
+    el.tasksCard = $('tasks-card');
+    el.tasksCount = $('tasks-count');
+    el.btnClearDone = $('btn-clear-done');
+    el.tasksEmpty = $('tasks-empty');
+    el.tasksList = $('tasks-list');
 
     el.progressCard = $('progress-card');
     el.progressPhase = $('progress-phase');
@@ -372,7 +404,10 @@
       try { data = JSON.parse(raw); } catch (err) { data = null; }
     }
     if (!response.ok) {
-      throw new Error(errorMessage(response, data));
+      // 把 HTTP 状态码挂在错误上：关闭任务时要区分 409（还在进行中）与 404（已不存在）
+      var failure = new Error(errorMessage(response, data));
+      failure.status = response.status;
+      throw failure;
     }
     if (data === null) { throw new Error('后端返回了无法解析的内容'); }
     return data;
@@ -560,6 +595,8 @@
     var busy = el.btnScan.classList.contains('is-loading') ||
       el.btnPreview.classList.contains('is-loading') ||
       el.btnStart.classList.contains('is-loading');
+    var bgBusy = el.btnBgPreview.classList.contains('is-loading') ||
+      el.btnBgCopy.classList.contains('is-loading');
     var cancelBusy = el.btnCancel.classList.contains('is-loading');
     var running = state.jobRunning;
     var configOk = Object.keys(state.errors).length === 0;
@@ -568,6 +605,10 @@
     el.btnScan.disabled = busy || running || !scanOk;
     el.btnPreview.disabled = busy || running || !configOk;
     el.btnStart.disabled = busy || running || !configOk;
+    // 后台按钮：只在「前台任务进行中（配置已锁）」或提交中禁用；其余按配置是否合法启用。
+    // 后台任务本身不锁配置，也不影响这两个按钮（用户可继续启动下一个操作）。
+    el.btnBgPreview.disabled = busy || bgBusy || running || !configOk;
+    el.btnBgCopy.disabled = busy || bgBusy || running || !configOk;
     el.btnCancel.disabled = !running || cancelBusy;
     el.actions.classList.toggle('is-running', running);
     el.configFields.classList.toggle('is-locked', running);
@@ -1250,13 +1291,20 @@
 
   function renderProgress(p) {
     if (!p) { resetProgress(); return; }
-    var percent = clamp(num(p.percent), 0, 100);
+    // 排队阶段（phase = queued）：进度条固定 0%，只显示排队位置；任务仍在进行，配置区保持锁定
+    var queued = p.phase === 'queued';
+    var percent = queued ? 0 : clamp(num(p.percent), 0, 100);
     var scanning = isScanPhase(p.phase);
     el.progressFill.style.width = percent.toFixed(2) + '%';
     el.progressBar.setAttribute('aria-valuenow', percent.toFixed(1));
     setText(el.progressPercent, percent.toFixed(1) + '%');
 
-    if (scanning) {
+    if (queued) {
+      setText(el.progressFiles, p.message || '排队中');
+      setText(el.progressBytesLabel, '合计体积');
+      setText(el.progressBytes, formatBytes(p.total_bytes));
+      setText(el.progressScanLabel, '命中文件 / 已读 EXIF');
+    } else if (scanning) {
       // 扫描 / 预览阶段：进度按「已扫描 / 待扫描」文件数展示
       setText(el.progressFiles, '已扫描 ' + formatCount(p.scanned_files) +
         ' / 共 ' + formatCount(p.scan_total_files) + ' 个文件');
@@ -1291,6 +1339,7 @@
   }
 
   function phasePlaceholder(phase) {
+    if (phase === 'queued') { return '排队中，等待前面的任务完成…'; }
     if (phase === 'counting') { return '正在统计待扫描文件…'; }
     if (phase === 'scanning') { return '正在扫描文件并读取 EXIF 拍摄时间…'; }
     if (phase === 'planning') { return '正在规划拷贝计划…'; }
@@ -1453,6 +1502,818 @@
     else { showToast('复制失败，请手动选择文本复制', 'error'); }
   }
 
+  /* ================= 后台任务中心 ================= */
+  /*
+   * 后端所有任务（前台 + 后台）共用一条串行队列：任一时刻最多 1 个真正执行，其余 status = queued。
+   * 本模块只做三件事：
+   *   1) 提交后台任务（POST /api/jobs）并登记卡片；
+   *   2) 400ms 轮询 GET /api/jobs?brief=1 更新进度（不为每个后台任务开 SSE）；
+   *   3) 终局后拉一次 GET /api/jobs/{id} 取 report 渲染结果摘要，关闭时 DELETE。
+   * 后台任务不锁定配置区（锁定只由前台任务的 setJobRunning 负责）。
+   */
+
+  function isTerminalStatus(status) { return TERMINAL_STATUSES.indexOf(status) >= 0; }
+
+  function isActiveStatus(status) { return ACTIVE_STATUSES.indexOf(status) >= 0; }
+
+  /** 任务是否仍在进行（排队中 / 运行中）；已失效的卡片不再视为进行中。 */
+  function isTaskActive(task) { return !!task && !task.stale && isActiveStatus(task.status); }
+
+  /** 任务卡片能否关闭：终局任务或已失效任务。 */
+  function isTaskDismissible(task) { return !!task && (!!task.stale || isTerminalStatus(task.status)); }
+
+  function activeTaskCount() {
+    return state.taskOrder.filter(function (id) { return isTaskActive(state.tasks[id]); }).length;
+  }
+
+  function dismissibleTaskCount() {
+    return state.taskOrder.filter(function (id) { return isTaskDismissible(state.tasks[id]); }).length;
+  }
+
+  function taskModeLabel(mode) { return TASK_MODE_LABELS[mode] || '后台任务'; }
+
+  /** 任务卡片的阶段徽标：{phase, label}。 */
+  function taskBadge(task) {
+    if (task.stale) { return { phase: 'stale', label: '已失效' }; }
+    if (task.status === 'queued') { return { phase: 'queued', label: PHASE_LABELS.queued }; }
+    if (task.status === 'done') { return { phase: 'finished', label: PHASE_LABELS.finished }; }
+    if (task.status === 'canceled') { return { phase: 'canceled', label: PHASE_LABELS.canceled }; }
+    if (task.status === 'failed') { return { phase: 'failed', label: PHASE_LABELS.failed }; }
+    var phase = task.progress && task.progress.phase ? task.progress.phase : '';
+    if (phase === 'queued') { return { phase: 'queued', label: PHASE_LABELS.queued }; }
+    if (PHASE_LABELS[phase]) { return { phase: phase, label: PHASE_LABELS[phase] }; }
+    return { phase: 'running', label: '进行中' };
+  }
+
+  /** 由 brief / 详情响应构造内部任务记录。 */
+  function makeTask(brief) {
+    var age = brief.age_seconds === null || brief.age_seconds === undefined ? null : num(brief.age_seconds);
+    return {
+      job_id: brief.job_id,
+      mode: brief.mode || '',
+      status: brief.status || 'queued',
+      dry_run: !!brief.dry_run,
+      queue_position: num(brief.queue_position),
+      age_seconds: age,
+      has_report: !!brief.has_report,
+      error: brief.error || null,
+      config: brief.config || null,
+      progress: normalizeProgress(brief.progress),
+      report: null,
+      reportLoaded: false,
+      stale: false,
+      staleToast: false,
+      built: false,
+      resultKey: '',
+      nodes: {}
+    };
+  }
+
+  function makeStat(labelText) {
+    var root = document.createElement('div');
+    root.className = 'stat';
+    var label = document.createElement('span');
+    label.className = 'stat__label';
+    label.textContent = labelText;
+    var value = document.createElement('span');
+    value.className = 'stat__value stat__value--mono';
+    value.textContent = '—';
+    root.appendChild(label);
+    root.appendChild(value);
+    return { root: root, label: label, value: value };
+  }
+
+  function metaGrid(pairs) {
+    var grid = document.createElement('div');
+    grid.className = 'meta-grid';
+    pairs.forEach(function (pair) {
+      var meta = document.createElement('div');
+      meta.className = 'meta';
+      var label = document.createElement('span');
+      label.className = 'meta__label';
+      label.textContent = pair[0];
+      var value = document.createElement('span');
+      value.className = 'meta__value meta__value--mono' + (pair[2] ? ' ' + pair[2] : '');
+      value.textContent = pair[1];
+      meta.appendChild(label);
+      meta.appendChild(value);
+      grid.appendChild(meta);
+    });
+    return grid;
+  }
+
+  /** 目标目录行：路径可点击复制。 */
+  function taskTargetRow(dir) {
+    var row = document.createElement('div');
+    row.className = 'report__target';
+    var label = document.createElement('span');
+    label.className = 'report__target-label';
+    label.textContent = '目标目录';
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'report__target-value';
+    button.textContent = dir || '—';
+    button.title = dir ? ('点击复制：' + dir) : '';
+    button.addEventListener('click', function () { copyAndToast(dir, '目标目录'); });
+    row.appendChild(label);
+    row.appendChild(button);
+    return row;
+  }
+
+  /**
+   * 折叠明细列表（最多展示 LIST_LIMIT = 500 条，并提示总数）。
+   * items 同时兼容「无 EXIF 时间清单」（path / suffix / reason）与「失败明细」（source / error / target）。
+   */
+  function taskDetails(title, items) {
+    var list = Array.isArray(items) ? items : [];
+    var details = document.createElement('details');
+    details.className = 'details';
+    var summary = document.createElement('summary');
+    summary.className = 'details__summary';
+    summary.textContent = title + '（' + formatCount(list.length) + '）';
+    var body = document.createElement('div');
+    body.className = 'details__body';
+    var ul = document.createElement('ul');
+    ul.className = 'list-scroll';
+
+    list.slice(0, LIST_LIMIT).forEach(function (item) {
+      var li = document.createElement('li');
+      li.className = 'list-item';
+
+      var path = document.createElement('span');
+      path.className = 'list-item__path';
+      var pathText = item.path || item.source || '(未知路径)';
+      path.textContent = pathText;
+      path.title = pathText;
+      li.appendChild(path);
+
+      if (item.suffix) {
+        var sfx = document.createElement('span');
+        sfx.className = 'list-item__suffix';
+        sfx.textContent = String(item.suffix).toUpperCase();
+        li.appendChild(sfx);
+      }
+      var reasonText = item.reason || item.error || '';
+      if (reasonText) {
+        var reason = document.createElement('span');
+        reason.className = 'list-item__reason';
+        reason.textContent = reasonText + (item.target ? ' → ' + item.target : '');
+        li.appendChild(reason);
+      }
+      ul.appendChild(li);
+    });
+    body.appendChild(ul);
+
+    if (list.length > LIST_LIMIT) {
+      var more = document.createElement('p');
+      more.className = 'list-more';
+      more.textContent = '已展示前 ' + LIST_LIMIT + ' 条，共 ' + formatCount(list.length) +
+        ' 条，还有 ' + formatCount(list.length - LIST_LIMIT) + ' 条未显示';
+      body.appendChild(more);
+    }
+    details.appendChild(summary);
+    details.appendChild(body);
+    return details;
+  }
+
+  /** 生成一张任务卡片的 DOM（只建一次，之后按 400ms 轮询做增量更新）。 */
+  function buildTaskCard(task) {
+    var li = document.createElement('li');
+    li.className = 'card task';
+    li.dataset.jobId = task.job_id;
+
+    var head = document.createElement('div');
+    head.className = 'card__head task__head';
+
+    var mode = document.createElement('span');
+    mode.className = 'task__mode';
+    mode.textContent = taskModeLabel(task.mode);
+
+    var badge = document.createElement('span');
+    badge.className = 'phase-badge';
+    badge.dataset.phase = 'queued';
+    badge.textContent = PHASE_LABELS.queued;
+
+    var spacer = document.createElement('span');
+    spacer.className = 'task__spacer';
+
+    var cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'btn btn--danger btn--sm task__cancel';
+    cancel.textContent = '取消';
+    cancel.addEventListener('click', function () { cancelTask(task.job_id); });
+
+    var close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'icon-btn task__close';
+    close.textContent = '×';
+    close.setAttribute('aria-label', '关闭任务卡片：' + taskModeLabel(task.mode));
+    close.title = '关闭并从列表移除（不影响已复制到磁盘的文件）';
+    close.hidden = true;
+    close.addEventListener('click', function () { dismissTask(task.job_id); });
+
+    head.appendChild(mode);
+    head.appendChild(badge);
+    head.appendChild(spacer);
+    head.appendChild(cancel);
+    head.appendChild(close);
+
+    var body = document.createElement('div');
+    body.className = 'card__body task__body';
+
+    var notice = document.createElement('p');
+    notice.className = 'task__queue';
+    notice.hidden = true;
+
+    var progress = document.createElement('div');
+    progress.className = 'progress';
+    var track = document.createElement('div');
+    track.className = 'progress__track';
+    var fill = document.createElement('div');
+    fill.className = 'progress__fill';
+    track.appendChild(fill);
+    var head2 = document.createElement('div');
+    head2.className = 'progress__head';
+    var percent = document.createElement('span');
+    percent.className = 'progress__percent';
+    percent.textContent = '0.0%';
+    var files = document.createElement('span');
+    files.className = 'progress__files';
+    files.textContent = '排队中';
+    head2.appendChild(percent);
+    head2.appendChild(files);
+
+    var stats = document.createElement('div');
+    stats.className = 'progress__stats';
+    var statBytes = makeStat('已复制 / 总字节');
+    var statSpeed = makeStat('速度');
+    var statEta = makeStat('剩余时间');
+    var statElapsed = makeStat('已用时间');
+    [statBytes, statSpeed, statEta, statElapsed].forEach(function (stat) { stats.appendChild(stat.root); });
+
+    var current = document.createElement('div');
+    current.className = 'progress__current';
+    var currentLabel = document.createElement('span');
+    currentLabel.className = 'progress__current-label';
+    currentLabel.textContent = '当前文件';
+    var currentName = document.createElement('span');
+    currentName.className = 'progress__current-name';
+    currentName.textContent = '排队中';
+    current.appendChild(currentLabel);
+    current.appendChild(currentName);
+
+    var message = document.createElement('p');
+    message.className = 'progress__message';
+    message.hidden = true;
+
+    progress.appendChild(track);
+    progress.appendChild(head2);
+    progress.appendChild(stats);
+    progress.appendChild(current);
+    progress.appendChild(message);
+
+    var result = document.createElement('div');
+    result.className = 'task__result';
+    result.hidden = true;
+
+    var errorNode = document.createElement('p');
+    errorNode.className = 'hint hint--error';
+    errorNode.hidden = true;
+
+    body.appendChild(notice);
+    body.appendChild(progress);
+    body.appendChild(result);
+    body.appendChild(errorNode);
+    li.appendChild(head);
+    li.appendChild(body);
+
+    task.nodes = {
+      root: li,
+      badge: badge,
+      cancel: cancel,
+      close: close,
+      notice: notice,
+      progress: progress,
+      fill: fill,
+      percent: percent,
+      files: files,
+      bytes: statBytes.value,
+      bytesLabel: statBytes.label,
+      speed: statSpeed.value,
+      eta: statEta.value,
+      elapsed: statElapsed.value,
+      current: currentName,
+      message: message,
+      result: result,
+      error: errorNode
+    };
+    task.built = true;
+    el.tasksList.appendChild(li);
+  }
+
+  /** 任务卡片进度区（与主进度卡同一套文案规则，排队阶段固定 0%）。 */
+  function renderTaskProgress(task) {
+    var n = task.nodes;
+    var p = task.progress || {};
+    var queued = task.status === 'queued' || p.phase === 'queued';
+    var percent = queued ? 0 : clamp(num(p.percent), 0, 100);
+
+    n.fill.style.width = percent.toFixed(2) + '%';
+    setText(n.percent, percent.toFixed(1) + '%');
+
+    if (queued) {
+      setText(n.files, '排队中');
+      setText(n.bytesLabel, '合计体积');
+      setText(n.bytes, formatBytes(p.total_bytes));
+    } else if (isScanPhase(p.phase)) {
+      setText(n.files, '已扫描 ' + formatCount(p.scanned_files) +
+        ' / 共 ' + formatCount(p.scan_total_files) + ' 个文件');
+      setText(n.bytesLabel, '合计体积');
+      setText(n.bytes, formatBytes(p.total_bytes));
+    } else {
+      setText(n.files, formatCount(p.done_files) + ' / ' + formatCount(p.total_files) + ' 个文件');
+      setText(n.bytesLabel, '已复制 / 总字节');
+      setText(n.bytes, formatBytes(p.done_bytes) + ' / ' + formatBytes(p.total_bytes));
+    }
+
+    setText(n.speed, formatSpeed(p.speed_bps));
+    setText(n.eta, formatDuration(p.eta_seconds));
+    setText(n.elapsed, formatDuration(p.elapsed_seconds));
+
+    if (p.current_file) {
+      setText(n.current, baseName(p.current_file));
+      n.current.title = p.current_file;
+    } else {
+      setText(n.current, phasePlaceholder(p.phase));
+      n.current.title = '';
+    }
+    setHint(n.message, p.message || '');
+  }
+
+  /** 终局结果摘要：preview → 计划摘要；copy → 执行摘要；scan → 扫描摘要。 */
+  function renderTaskResult(task) {
+    var box = task.nodes.result;
+    clearNode(box);
+    setHidden(box, false);
+
+    if (task.stale) {
+      var staleMsg = document.createElement('p');
+      staleMsg.className = 'hint hint--warn';
+      staleMsg.textContent = '该任务已不在后端任务列表中（后端可能已重启，或已在其他标签页关闭）。此卡片可关闭。';
+      box.appendChild(staleMsg);
+      return;
+    }
+    if (!task.reportLoaded) {
+      var pending = document.createElement('p');
+      pending.className = 'hint';
+      pending.textContent = '正在读取任务结果…';
+      box.appendChild(pending);
+      return;
+    }
+
+    var report = task.report || null;
+    if (!report) {
+      var none = document.createElement('p');
+      none.className = 'hint';
+      none.textContent = task.status === 'failed' ? '任务失败，未生成报告。' : '任务已结束，没有可显示的报告。';
+      box.appendChild(none);
+      return;
+    }
+
+    var mode = report.mode || task.mode;
+    if (mode === 'preview') { renderTaskPlanResult(box, report); return; }
+    if (mode === 'scan') { renderTaskScanResult(box, report); return; }
+    renderTaskCopyResult(box, report);
+  }
+
+  function renderTaskPlanResult(box, report) {
+    var plan = report.plan || null;
+    if (!plan) {
+      var none = document.createElement('p');
+      none.className = 'hint';
+      none.textContent = '任务已结束，但报告中没有拷贝计划。';
+      box.appendChild(none);
+      return;
+    }
+    box.appendChild(taskTargetRow(plan.target_dir));
+    box.appendChild(metaGrid([
+      ['文件夹名', plan.folder_name || '—'],
+      ['计划文件数', formatCount(plan.planned_files)],
+      ['计划体积', formatBytes(plan.planned_bytes)],
+      ['范围外跳过', formatCount(plan.out_of_range_files)],
+      ['无 EXIF 时间', formatCount(plan.no_time_files), 'meta__value--warn']
+    ]));
+    var noTime = Array.isArray(plan.no_time) ? plan.no_time : [];
+    if (noTime.length > 0) { box.appendChild(taskDetails('无 EXIF 时间文件清单', noTime)); }
+  }
+
+  function renderTaskScanResult(box, report) {
+    var scan = pickScanReport(report) || report.scan || null;
+    if (!scan) {
+      var none = document.createElement('p');
+      none.className = 'hint';
+      none.textContent = '任务已结束，没有可显示的报告。';
+      box.appendChild(none);
+      return;
+    }
+    box.appendChild(metaGrid([
+      ['配对照片数', formatCount(scan.groups)],
+      ['命中文件数', formatCount(scan.matched_files)],
+      ['合计体积', formatBytes(scan.total_bytes)],
+      ['可确定拍摄时间', formatCount(scan.with_time)],
+      ['无 EXIF 时间', formatCount(scan.no_time), 'meta__value--warn']
+    ]));
+    var noTime = Array.isArray(scan.no_time_files) ? scan.no_time_files : [];
+    if (noTime.length > 0) { box.appendChild(taskDetails('无 EXIF 时间文件清单', noTime)); }
+  }
+
+  function renderTaskCopyResult(box, report) {
+    box.appendChild(taskTargetRow(report.target_dir));
+    box.appendChild(metaGrid([
+      ['成功复制', formatCount(report.copied_files), 'meta__value--ok'],
+      ['跳过（已存在）', formatCount(report.skipped_existing)],
+      ['失败', formatCount(report.failed_files), 'meta__value--warn'],
+      ['无 EXIF 时间', formatCount(report.no_time_files)],
+      ['已复制字节', formatBytes(report.copied_bytes) + ' / ' + formatBytes(report.total_bytes)],
+      ['耗时', formatDuration(report.elapsed_seconds)]
+    ]));
+    var failures = Array.isArray(report.failures) ? report.failures : [];
+    if (failures.length > 0) { box.appendChild(taskDetails('失败明细', failures)); }
+  }
+
+  /** 增量刷新一张任务卡片。 */
+  function updateTaskCard(task) {
+    if (!task || !task.built) { return; }
+    var n = task.nodes;
+    var badge = taskBadge(task);
+    n.badge.dataset.phase = badge.phase;
+    setText(n.badge, badge.label);
+    n.root.dataset.status = task.stale ? 'stale' : (task.status || '');
+    n.root.classList.toggle('task--active', isTaskActive(task));
+    n.root.classList.toggle('task--stale', !!task.stale);
+
+    var dismissible = isTaskDismissible(task);
+    var active = isTaskActive(task);
+    n.cancel.hidden = !active;
+    n.cancel.disabled = !active;
+    n.close.hidden = !dismissible;
+
+    if (task.stale) {
+      setText(n.notice, '已失效：后端任务列表中已不存在该任务');
+      n.notice.classList.add('is-stale');
+      n.notice.hidden = false;
+      n.progress.hidden = true;
+    } else if (active) {
+      n.progress.hidden = false;
+      if (task.status === 'queued' || (task.progress && task.progress.phase === 'queued')) {
+        var ahead = Math.max(task.queue_position - 1, 0);
+        setText(n.notice, '排队中 · 前面还有 ' + formatCount(ahead) + ' 个');
+        n.notice.classList.remove('is-stale');
+        n.notice.hidden = false;
+      } else {
+        n.notice.hidden = true;
+        n.notice.textContent = '';
+      }
+      renderTaskProgress(task);
+    } else {
+      // 已完成 / 已取消 / 失败：保留进度行并固定显示最终值（与主进度卡一致），
+      // 给用户"跑完了"的视觉闭环；数值来自终局详情里的 progress。
+      n.progress.hidden = false;
+      n.notice.hidden = true;
+      n.notice.textContent = '';
+      renderTaskProgress(task);
+    }
+
+    if (dismissible) {
+      // 终局 / 已失效：结果摘要只在内容变化时重建（避免折叠面板被反复重置）
+      var resultKey = task.stale ? 'stale'
+        : (task.status + '|' + (task.report ? 'report' : (task.reportLoaded ? 'noreport' : 'pending')));
+      if (task.resultKey !== resultKey) {
+        task.resultKey = resultKey;
+        renderTaskResult(task);
+      }
+    } else {
+      setHidden(n.result, true);
+      task.resultKey = '';
+    }
+
+    if (task.error) { setHint(n.error, '任务错误：' + task.error); }
+    else { setHint(n.error, ''); }
+  }
+
+  function renderTasksMeta() {
+    var total = state.taskOrder.length;
+    var active = activeTaskCount();
+    var done = dismissibleTaskCount();
+    var text = total === 0
+      ? '暂无任务'
+      : ('共 ' + total + ' 个任务' + (active > 0 ? '（' + active + ' 个进行中）' : ''));
+    setText(el.tasksCount, text);
+    setHidden(el.tasksEmpty, total > 0);
+    // 清除进行中保持禁用，避免中途被重新启用导致重复提交
+    el.btnClearDone.disabled = done === 0 || el.btnClearDone.classList.contains('is-loading');
+  }
+
+  function registerTask(brief) {
+    var task = makeTask(brief);
+    state.tasks[task.job_id] = task;
+    state.taskOrder.push(task.job_id);
+    buildTaskCard(task);
+    updateTaskCard(task);
+    renderTasksMeta();
+    return task;
+  }
+
+  function removeTask(jobId) {
+    var task = state.tasks[jobId];
+    if (!task) { return; }
+    if (task.nodes.root && task.nodes.root.parentNode) {
+      task.nodes.root.parentNode.removeChild(task.nodes.root);
+    }
+    delete state.tasks[jobId];
+    var index = state.taskOrder.indexOf(jobId);
+    if (index >= 0) { state.taskOrder.splice(index, 1); }
+    renderTasksMeta();
+    ensureTaskPoller();
+  }
+
+  /* ---------- 启动后台任务 ---------- */
+
+  /** 后台任务的排队提示：运行中 / 排队中（前面还有 N 个）。 */
+  function queueHint(status, position) {
+    if (status === 'queued') {
+      return '排队中，前面还有 ' + formatCount(Math.max(num(position) - 1, 0)) + ' 个任务';
+    }
+    return '正在执行';
+  }
+
+  async function startBackgroundJob(mode) {
+    if (mode !== 'preview' && mode !== 'copy') { return; }
+    var button = mode === 'preview' ? el.btnBgPreview : el.btnBgCopy;
+    if (!button) { return; }
+    if (state.jobRunning) {
+      showToast('前台任务进行中，配置已锁定，请等待其结束或先取消', 'error');
+      return;
+    }
+    if (button.disabled) {
+      // 按钮禁用时（配置不合法 / 提交中）仍给出原因，避免"点了没反应"
+      renderValidation({ showSummary: true });
+      if (Object.keys(state.errors).length > 0) {
+        showToast('配置不完整，请先修正左侧提示再启动后台任务', 'error');
+      }
+      return;
+    }
+
+    renderValidation({ showSummary: true });
+    if (Object.keys(state.errors).length > 0) {
+      showToast('配置不完整，请先修正左侧提示再启动后台任务', 'error');
+      return;
+    }
+
+    var config = buildConfig();
+    setLoading(button, true, '提交中…');
+    try {
+      var job = await postJson(API.jobs, {
+        config: config,
+        mode: mode,
+        dry_run: mode !== 'copy',
+        // 后台任务按提交顺序 FIFO 排队；不带该标记会被后端当成前台任务插到队首
+        background: true
+      });
+      var status = job.status || 'queued';
+      var position = num(job.queue_position);
+      var progress;
+      if (status === 'queued') {
+        progress = { phase: 'queued', percent: 0, message: '排队中：前面还有 ' + Math.max(position - 1, 0) + ' 个任务' };
+      } else {
+        progress = { phase: 'counting', percent: 0, message: '' };
+      }
+      var task = registerTask({
+        job_id: job.job_id,
+        mode: job.mode || mode,
+        status: status,
+        dry_run: !!(job.dry_run === undefined ? (mode !== 'copy') : job.dry_run),
+        queue_position: position,
+        age_seconds: null,
+        has_report: false,
+        error: null,
+        config: config,
+        progress: progress
+      });
+      showToast('已加入后台队列：' + taskModeLabel(task.mode) + '（' + queueHint(status, position) + '）', 'info');
+      ensureTaskPoller();
+      pollTasks(); // 立刻取一次真实排队位置 / 进度，不用等满 400ms
+    } catch (err) {
+      // 例如同一目标目录的第二个拷贝任务：后端返回 409，这里原样显示中文提示，不建卡片
+      showToast(err.message, 'error');
+    } finally {
+      setLoading(button, false);
+      renderValidation();
+    }
+  }
+
+  async function cancelTask(jobId) {
+    var task = state.tasks[jobId];
+    if (!task || !isTaskActive(task)) { return; }
+    task.nodes.cancel.disabled = true;
+    try {
+      var res = await postJson(API.cancel(jobId), { job_id: jobId, canceled: true });
+      if (res && res.canceled === false) { showToast('任务已结束，无需取消', 'info'); }
+      else { showToast('已发送取消请求：已完成的拷贝会保留', 'info'); }
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      if (state.tasks[jobId]) { state.tasks[jobId].nodes.cancel.disabled = !isTaskActive(state.tasks[jobId]); }
+    }
+  }
+
+  /* ---------- 关闭 / 清除 ---------- */
+
+  async function dismissTask(jobId) {
+    var task = state.tasks[jobId];
+    if (!task) { return; }
+    var close = task.nodes.close;
+    if (close) { close.disabled = true; }
+    try {
+      await request(API.job(jobId), { method: 'DELETE' });
+      removeTask(jobId);
+    } catch (err) {
+      if (err && err.status === 404) {
+        // 后端已遗忘该任务（例如已过保留期）：卡片同样应该消失
+        removeTask(jobId);
+        showToast('该任务在后端已不存在，卡片已移除', 'info');
+      } else if (err && err.status === 409) {
+        // 任务还在进行中：保留卡片并提示，交给用户先取消
+        showToast(err.message, 'error');
+      } else {
+        showToast('关闭任务失败：' + err.message, 'error');
+      }
+    } finally {
+      var current = state.tasks[jobId];
+      if (current && current.nodes.close) { current.nodes.close.disabled = false; }
+    }
+  }
+
+  async function clearDoneTasks() {
+    if (el.btnClearDone.classList.contains('is-loading')) { return; }
+    var ids = state.taskOrder.filter(function (id) { return isTaskDismissible(state.tasks[id]); });
+    if (ids.length === 0) { showToast('没有已完成的任务', 'info'); return; }
+
+    setLoading(el.btnClearDone, true, '清除中…');
+    var removed = 0;
+    var failed = 0;
+    for (var i = 0; i < ids.length; i += 1) {
+      var id = ids[i];
+      if (!state.tasks[id]) { continue; }
+      try {
+        await request(API.job(id), { method: 'DELETE' });
+        removeTask(id);
+        removed += 1;
+      } catch (err) {
+        if (err && err.status === 404) { removeTask(id); removed += 1; }
+        else if (err && err.status === 409) { failed += 1; showToast(err.message, 'error'); }
+        else { failed += 1; showToast('清除任务失败：' + err.message, 'error'); }
+      }
+    }
+    setLoading(el.btnClearDone, false);
+    renderTasksMeta();
+    if (removed > 0) {
+      showToast('已清除 ' + removed + ' 个已完成任务' + (failed > 0 ? ('，' + failed + ' 个未清除') : ''),
+        failed > 0 ? 'error' : 'ok');
+    }
+  }
+
+  /* ---------- 400ms 轮询 ---------- */
+
+  function ensureTaskPoller() {
+    if (activeTaskCount() === 0) { stopTaskPoller(); return; }
+    if (state.taskPoller !== null) { return; }
+    state.taskPoller = window.setInterval(pollTasks, TASK_POLL_MS);
+  }
+
+  function stopTaskPoller() {
+    if (state.taskPoller !== null) {
+      window.clearInterval(state.taskPoller);
+      state.taskPoller = null;
+    }
+  }
+
+  async function pollTasks() {
+    if (state.taskPolling) { return; }
+    if (activeTaskCount() === 0) { stopTaskPoller(); return; }
+    state.taskPolling = true;
+    try {
+      var data = await request(API.jobsBrief);
+      applyTaskBriefs(data && Array.isArray(data.jobs) ? data.jobs : []);
+    } catch (err) {
+      // 网络抖动 / 后端短暂不可用：保持轮询，下一轮再试，不打断界面
+    } finally {
+      state.taskPolling = false;
+    }
+    if (activeTaskCount() === 0) { stopTaskPoller(); }
+  }
+
+  function applyTaskBriefs(list) {
+    var seen = {};
+    list.forEach(function (item) { if (item && item.job_id) { seen[item.job_id] = item; } });
+    state.taskOrder.slice().forEach(function (id) {
+      var task = state.tasks[id];
+      if (!task) { return; }
+      var brief = seen[id];
+      if (!brief) { markTaskStale(task); return; }
+      applyTaskBrief(task, brief);
+    });
+  }
+
+  function applyTaskBrief(task, brief) {
+    var wasActive = isTaskActive(task);
+    task.status = brief.status || task.status;
+    task.mode = brief.mode || task.mode;
+    task.dry_run = !!brief.dry_run;
+    task.queue_position = num(brief.queue_position);
+    task.age_seconds = brief.age_seconds === null || brief.age_seconds === undefined ? null : num(brief.age_seconds);
+    task.has_report = !!brief.has_report;
+    task.error = brief.error || null;
+    if (brief.config) { task.config = brief.config; }
+    var progress = normalizeProgress(brief.progress);
+    if (progress) { task.progress = progress; }
+
+    updateTaskCard(task);
+    renderTasksMeta();
+
+    // 非终局 → 终局：只拉一次详情补 report
+    if (wasActive && !task.stale && isTerminalStatus(task.status)) {
+      fetchTaskDetail(task);
+    }
+  }
+
+  /** 终局后拉一次 GET /api/jobs/{id}（brief 列表不含 report 正文）。 */
+  async function fetchTaskDetail(task) {
+    if (!task || task.reportLoaded || task.stale) { return; }
+    task.reportLoaded = true;
+    try {
+      var data = await request(API.job(task.job_id));
+      task.report = data.report || null;
+      task.status = data.status || task.status;
+      // 终局详情里的 progress 才是最终值：brief 轮询可能停在 96% 这类中间值，
+      // 不覆盖的话"已完成"的卡片会一直显示没到 100% 的百分比。
+      var detailProgress = normalizeProgress(data.progress);
+      if (detailProgress) { task.progress = detailProgress; }
+      task.queue_position = num(data.queue_position);
+      task.age_seconds = (data.age_seconds === null || data.age_seconds === undefined)
+        ? null : num(data.age_seconds);
+      task.dry_run = !!data.dry_run;
+      if (data.error) { task.error = data.error; }
+      if (task.mode === '' && data.mode) { task.mode = data.mode; }
+    } catch (err) {
+      if (err && err.status === 404) { markTaskStale(task); return; }
+      task.reportLoaded = false;
+      showToast('读取任务结果失败：' + err.message, 'error');
+      return;
+    }
+    updateTaskCard(task);
+    renderTasksMeta();
+  }
+
+  /** 已登记任务从 brief 列表中消失（后端重启 / 其他标签页已关闭它）。 */
+  function markTaskStale(task) {
+    if (!task || task.stale) { return; }
+    task.stale = true;
+    updateTaskCard(task);
+    renderTasksMeta();
+    if (!task.staleToast) {
+      task.staleToast = true;
+      showToast('任务 ' + taskModeLabel(task.mode) + ' 已不在后端任务列表中，卡片已标记为「已失效」', 'info');
+    }
+  }
+
+  /* ---------- 刷新恢复 ---------- */
+
+  /** 刷新页面后恢复：全部 queued / running，以及 10 分钟内完成的终局任务（需拉详情补 report）。 */
+  async function restoreTasks() {
+    var data = null;
+    try {
+      data = await request(API.jobsBrief);
+    } catch (err) {
+      return; // 后端未就绪时静默跳过，不影响其他功能
+    }
+    var list = data && Array.isArray(data.jobs) ? data.jobs : [];
+    var pending = [];
+    list.forEach(function (brief) {
+      if (!brief || !brief.job_id || state.tasks[brief.job_id]) { return; }
+      var active = isActiveStatus(brief.status || '');
+      var recent = brief.age_seconds !== null && brief.age_seconds !== undefined &&
+        num(brief.age_seconds) <= TASK_RESTORE_SECONDS;
+      if (!active && !recent) { return; }
+      var task = registerTask(brief);
+      if (!active) { pending.push(task); }
+    });
+    ensureTaskPoller();
+    for (var i = 0; i < pending.length; i += 1) {
+      await fetchTaskDetail(pending[i]);
+    }
+  }
+
   /* ================= 默认值与初始化 ================= */
 
   function padDate(date) {
@@ -1514,6 +2375,9 @@
     el.btnScan.addEventListener('click', handleScan);
     el.btnPreview.addEventListener('click', handlePreview);
     el.btnStart.addEventListener('click', handleStart);
+    el.btnBgPreview.addEventListener('click', function () { startBackgroundJob('preview'); });
+    el.btnBgCopy.addEventListener('click', function () { startBackgroundJob('copy'); });
+    el.btnClearDone.addEventListener('click', clearDoneTasks);
     el.btnCancel.addEventListener('click', handleCancel);
     el.btnReconnectSse.addEventListener('click', function () {
       if (!state.jobId || !state.jobRunning) { showToast('当前没有运行中的任务', 'info'); return; }
@@ -1549,6 +2413,7 @@
     window.addEventListener('beforeunload', function () {
       closeEvents();
       stopPolling();
+      stopTaskPoller(); // 页面卸载：停掉后台任务中心轮询
     });
   }
 
@@ -1558,10 +2423,13 @@
     setConfigLocked(false);
     bindEvents();
     resetProgress();
+    renderTasksMeta();
     updateLiveEmpty();
     await loadDefaults();
     renderValidation();
     loadHealth();
+    // 刷新恢复：排队中 / 运行中的任务 + 最近 10 分钟内完成的终局任务
+    await restoreTasks();
   }
 
   if (document.readyState === 'loading') {

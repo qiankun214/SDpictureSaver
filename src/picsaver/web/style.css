@@ -435,6 +435,61 @@ code { font-family: var(--font-mono); }
 .phase-badge[data-phase="finished"] { color: var(--ok); border-color: rgba(87, 192, 141, 0.4); background: rgba(87, 192, 141, 0.12); }
 .phase-badge[data-phase="canceled"] { color: var(--warn); border-color: rgba(226, 165, 76, 0.4); background: rgba(226, 165, 76, 0.12); }
 .phase-badge[data-phase="failed"] { color: var(--danger); border-color: rgba(226, 104, 95, 0.45); background: rgba(226, 104, 95, 0.12); }
+.phase-badge[data-phase="queued"] { color: var(--text-dim); border-color: var(--line); background: var(--surface-3); }
+.phase-badge[data-phase="running"] { color: var(--info); border-color: rgba(99, 169, 232, 0.4); background: rgba(99, 169, 232, 0.12); }
+.phase-badge[data-phase="stale"] { color: var(--text-faint); border-color: var(--line); background: var(--surface-2); }
+
+/* ---------- 后台任务中心 ---------- */
+.card--tasks .card__head { align-items: center; }
+
+.task-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+.card--tasks .empty { padding: 16px 14px; }
+
+.tasks-list { display: flex; flex-direction: column; gap: 12px; }
+
+.task {
+  box-shadow: none;
+  background: var(--bg-soft);
+  border-color: var(--line-soft);
+}
+
+.task--active { border-color: var(--accent-line); }
+.task--stale { border-style: dashed; opacity: 0.75; }
+
+.task__head { align-items: center; gap: 8px; padding: 9px 12px; }
+
+.task__mode { font-size: 13px; font-weight: 600; letter-spacing: 0.01em; }
+
+.task__spacer { flex: 1 1 auto; min-width: 0; }
+
+.task__body { padding: 12px; gap: 10px; }
+
+.task__queue {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--info);
+}
+
+.task__queue.is-stale { color: var(--warn); }
+
+.task__result { display: flex; flex-direction: column; gap: 10px; }
+
+.task__close { font-size: 16px; line-height: 1; }
+
+.task__cancel { flex: none; }
+
+.task .progress { gap: 8px; }
+.task .progress__track { height: 10px; }
+.task .progress__percent { font-size: 18px; }
+.task .progress__stats { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); padding: 8px 10px; }
+.task .meta-grid { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
+.task .list-scroll { max-height: 200px; }
+
+@media (max-width: 820px) {
+  .task__head { flex-wrap: wrap; }
+  .task .progress__stats, .task .meta-grid { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
+}
 
 .progress { display: flex; flex-direction: column; gap: 10px; }
 

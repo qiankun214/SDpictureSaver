@@ -166,17 +166,34 @@
             <button class="btn btn--ghost" type="button" id="btn-scan">扫描源目录</button>
             <button class="btn" type="button" id="btn-preview">预览计划</button>
             <button class="btn btn--primary" type="button" id="btn-start">开始拷贝</button>
+            <button class="btn" type="button" id="btn-bg-preview">后台预览计划</button>
+            <button class="btn" type="button" id="btn-bg-copy">后台拷贝</button>
             <button class="btn btn--danger" type="button" id="btn-cancel" disabled>取消任务</button>
           </div>
 
           <p class="hint">「预览计划」只做计算、不写入磁盘；「开始拷贝」会真实复制文件</p>
+          <p class="hint">「后台」按钮把任务加入串行队列（同一时刻只跑一个），排队期间仍可继续修改参数并启动下一个任务，进度在右列「后台任务」中查看</p>
 
         </div>
       </form>
     </section>
 
-    <!-- ============ 右列：进度 / 摘要 / 报告 ============ -->
+    <!-- ============ 右列：后台任务 / 进度 / 摘要 / 报告 ============ -->
     <section class="col col--live" aria-label="运行状态">
+
+      <section class="card card--tasks" id="tasks-card">
+        <div class="card__head">
+          <h2 class="card__title">后台任务</h2>
+          <div class="task-head">
+            <span class="card__meta" id="tasks-count">暂无任务</span>
+            <button class="btn btn--ghost btn--sm" type="button" id="btn-clear-done" disabled>清除已完成</button>
+          </div>
+        </div>
+        <div class="card__body">
+          <p class="empty" id="tasks-empty">暂无后台任务：点击左侧「后台预览计划」或「后台拷贝」加入队列；任务串行执行，排队期间可继续启动下一个操作。</p>
+          <ul class="tasks-list" id="tasks-list"></ul>
+        </div>
+      </section>
 
       <section class="card card--progress" id="progress-card">
         <div class="card__head">
