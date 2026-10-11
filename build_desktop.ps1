@@ -5,6 +5,9 @@
 #   .\build_desktop.ps1 -OneDir      # onedir  (dist\pictureSaver2\pictureSaver2.exe)
 #   .\build_desktop.ps1 -SkipInstall # do not try to install PyInstaller
 #
+# If the onefile exe reports "could not create temporary directory", use -OneDir:
+# onedir does not extract anything to %TEMP%.
+#
 # Requires: Python 3.10+, PySide6 (with QtWebEngine). PyInstaller is a BUILD-only
 # dependency and is installed from the Tsinghua mirror when missing.
 #
@@ -61,15 +64,9 @@ if (-not (Test-Path $icon)) {
 # 4) build
 if ($OneDir) {
     Write-Host "Building ONEDIR ..."
-    New-Item -ItemType Directory -Force -Path (Join-Path $root 'build') | Out-Null
-    # Absolute paths only: with --specpath, PyInstaller resolves relative paths
-    # against the spec directory, so a relative 'src\picsaver\web' is not found.
     $pyArgs = @(
         '-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--windowed',
         '--name', 'pictureSaver2',
-        '--specpath', (Join-Path $root 'build'),
-        '--workpath', (Join-Path $root 'build\onedir'),
-        '--distpath', (Join-Path $root 'dist'),
         '--icon', $icon,
         '--add-data', ((Join-Path $root 'src\picsaver\web') + ';picsaver/web'),
         '--paths', (Join-Path $root 'src'),
@@ -79,9 +76,6 @@ if ($OneDir) {
         '--hidden-import', 'uvicorn.protocols.websockets.auto',
         '--hidden-import', 'uvicorn.lifespan.on',
         '--hidden-import', 'sse_starlette.sse',
-        '--exclude-module', 'pytest',
-        '--exclude-module', 'tkinter',
-        '--exclude-module', 'pydoc',
         (Join-Path $root 'src\picsaver\desktop\__main__.py')
     )
     & $python @pyArgs

@@ -353,6 +353,12 @@ python scripts\verify_desktop.py --launch-exe dist\pictureSaver2.exe --app-port 
   只想确认环境是否正常、不想开窗口，用 `.\run_desktop.cmd --smoke`。
 - **桌面窗口一闪就没了？** 先跑 `.\run_desktop.cmd --smoke` 看服务与界面资源是否正常，再看
   `%LOCALAPPDATA%\pictureSaver2\desktop.log`；若弹窗提示窗口不可用，程序会自动改用浏览器打开同一界面。
+- **打包后的单文件 exe 报 `could not create temporary directory`？** 这是 onefile 的固有机制：每次启动都要把约
+  400–500 MB **解压到临时目录**，`%TEMP%` 不可写（权限、清理策略、杀软拦截、非标准会话临时目录）就会报这个错。
+  处理：**改用目录版** `.\build_desktop.ps1 -OneDir`（不做解压，最稳）；或先确认 `%TEMP%` 可用：
+  `Test-Path $env:TEMP`、`New-Item -ItemType Directory "$env:TEMP\_MEI_test" -Force`。
+- **单文件 exe 和目录版怎么选？** 单文件便于分发但每次启动要解压（慢、易被杀软误报、依赖 `%TEMP%`）；
+  目录版启动快、无解压、无上述问题，缺点是产物是一个文件夹。源码运行/快捷方式启动（第 4 节）不受这两者影响。
 - **无 EXIF 时间的照片怎么办？** 会被跳过并列出。想一并归档时，可先用相机/软件写入拍摄时间，或单独手动处理这些文件。
 - **同名文件来自不同子目录？** 目标内自动加 `_1`、`_2`，并在报告中记为"重名改名"。
 - **能重复运行吗？** 可以。已存在且大小相同的文件会记为"已存在跳过"，不会重复写入。
