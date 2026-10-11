@@ -8,8 +8,13 @@
 # Requires: Python 3.10+, PySide6 (with QtWebEngine). PyInstaller is a BUILD-only
 # dependency and is installed from the Tsinghua mirror when missing.
 #
-# NOTE: native commands (python/pip/PyInstaller) write warnings to stderr, so this
-# script keeps ErrorActionPreference = 'Continue' and checks $LASTEXITCODE instead.
+# NOTE 1: keep this file ASCII-only. Windows PowerShell 5.1 decodes a BOM-less
+#         .ps1 as ANSI, so non-ASCII comments corrupt the script (happened once:
+#         a Chinese comment swallowed the newline and broke the whole build).
+# NOTE 2: no backtick line continuations. Arguments are passed as an array so
+#         there is nothing for ANSI decoding or trailing spaces to break.
+# NOTE 3: native commands (python/pip/PyInstaller) write warnings to stderr, so
+#         ErrorActionPreference stays 'Continue' and $LASTEXITCODE is checked.
 
 param(
     [switch]$OneDir,
@@ -25,7 +30,7 @@ Write-Host "python : $python"
 
 function Test-PythonModule {
     param([string]$Name)
-    # 只用 stdout 回传结果，避免 ImportError 的 traceback 干扰 PowerShell
+    # Only stdout carries the result, so an ImportError traceback cannot upset PowerShell.
     $code = "import importlib.util as u, sys; sys.stdout.write('1' if u.find_spec('$Name') else '0')"
     $result = & $python -c $code
     return ("$result".Trim() -eq '1')
@@ -47,38 +52,47 @@ if (-not (Test-PythonModule 'PyInstaller')) {
 Write-Host "PyInstaller: OK"
 
 # 3) icon
-if (-not (Test-Path 'src\picsaver\desktop\icon.ico')) {
-    & $python scripts\make_icon.py
+$icon = Join-Path $root 'src\picsaver\desktop\icon.ico'
+if (-not (Test-Path $icon)) {
+    & $python (Join-Path $root 'scripts\make_icon.py')
     if ($LASTEXITCODE -ne 0) { throw "icon generation failed (exit $LASTEXITCODE)" }
 }
 
 # 4) build
 if ($OneDir) {
     Write-Host "Building ONEDIR ..."
-    New-Item -ItemType Directory -Force -Path build | Out-Null
-    # 注意：给了 --specpath 之后，PyInstaller 以 spec 所在目录为基准解析相对路径，
-    # 所以这里所有路径都用绝对路径（$root 前缀），否则会报 "Unable to find ... web"。
-    & $python -m PyInstaller --noconfirm --clean --onedir --windowed --name pictureSaver2 `
-        --specpath build --workpath "build\onedir" --distpath dist `
-        --icon "$root\src\picsaver\desktop\icon.ico" `
-        --add-data "$root\src\picsaver\web;picsaver\web" `
-        --paths "$root\src" `
-        --hidden-import uvicorn.logging `
-        --hidden-import uvicorn.loops.auto `
-        --hidden-import uvicorn.protocols.http.auto `
-        --hidden-import uvicorn.protocols.websockets.auto `
-        --hidden-import uvicorn.lifespan.on `
-        --hidden-import sse_starlette.sse `
-        --exclude-module pytest --exclude-module tkinter --exclude-module pydoc `
-        "$root\src\picsaver\desktop\__main__.py"
+    New-Item -ItemType Directory -Force -Path (Join-Path $root 'build') | Out-Null
+    # Absolute paths only: with --specpath, PyInstaller resolves relative paths
+    # against the spec directory, so a relative 'src\picsaver\web' is not found.
+    $pyArgs = @(
+        '-m', 'PyInstaller', '--noconfirm', '--clean', '--onedir', '--windowed',
+        '--name', 'pictureSaver2',
+        '--specpath', (Join-Path $root 'build'),
+        '--workpath', (Join-Path $root 'build\onedir'),
+        '--distpath', (Join-Path $root 'dist'),
+        '--icon', $icon,
+        '--add-data', ((Join-Path $root 'src\picsaver\web') + ';picsaver/web'),
+        '--paths', (Join-Path $root 'src'),
+        '--hidden-import', 'uvicorn.logging',
+        '--hidden-import', 'uvicorn.loops.auto',
+        '--hidden-import', 'uvicorn.protocols.http.auto',
+        '--hidden-import', 'uvicorn.protocols.websockets.auto',
+        '--hidden-import', 'uvicorn.lifespan.on',
+        '--hidden-import', 'sse_starlette.sse',
+        '--exclude-module', 'pytest',
+        '--exclude-module', 'tkinter',
+        '--exclude-module', 'pydoc',
+        (Join-Path $root 'src\picsaver\desktop\__main__.py')
+    )
+    & $python @pyArgs
 } else {
     Write-Host "Building ONEFILE ..."
-    & $python -m PyInstaller --noconfirm --clean "packaging\picsaver-desktop.spec"
+    & $python -m PyInstaller --noconfirm --clean (Join-Path $root 'packaging\picsaver-desktop.spec')
 }
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
 
 # 5) report
-$exe = if ($OneDir) { "dist\pictureSaver2\pictureSaver2.exe" } else { "dist\pictureSaver2.exe" }
+$exe = if ($OneDir) { Join-Path $root 'dist\pictureSaver2\pictureSaver2.exe' } else { Join-Path $root 'dist\pictureSaver2.exe' }
 if (-not (Test-Path $exe)) { throw "expected output not found: $exe" }
 $sizeMB = [math]::Round((Get-Item $exe).Length / 1MB, 1)
 Write-Host ""
