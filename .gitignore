@@ -12,6 +12,8 @@ dist/
 .pytest_cache/
 .coverage
 htmlcov/
+# PyInstaller 在仓库根目录生成的 spec（我们的配置固定在 packaging/ 下）
+/*.spec
 
 # 编辑器 / 系统
 .vscode/

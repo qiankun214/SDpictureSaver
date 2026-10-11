@@ -55,7 +55,9 @@ if (-not (Test-Path 'src\picsaver\desktop\icon.ico')) {
 # 4) build
 if ($OneDir) {
     Write-Host "Building ONEDIR ..."
+    New-Item -ItemType Directory -Force -Path build | Out-Null
     & $python -m PyInstaller --noconfirm --clean --onedir --windowed --name pictureSaver2 `
+        --specpath build --workpath "build\onedir" --distpath dist `
         --icon "src\picsaver\desktop\icon.ico" `
         --add-data "src\picsaver\web;picsaver\web" `
         --paths src `

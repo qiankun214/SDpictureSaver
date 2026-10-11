@@ -161,4 +161,10 @@ pictureSaver2/
   PyInstaller 属**构建期**依赖，不写入运行依赖。
 - QtWebEngine（Chromium）**在受限沙箱内无法创建命名管道**（实测 `named-platform-channel-pipe ... 拒绝访问 0x5` 直接崩溃）：
   桌面窗口只能在不受限会话里运行/验证，`--smoke` 模式不受影响（不开窗口）。
+- **打包实测（2026-10-11）**：PyInstaller **onedir 在受限沙箱内可正常运行**（`--smoke` 返回 ok）；
+  **onefile 不行**——解压成功但引导器与子进程的握手失败（退出码 -1），需在普通会话运行。
+  因此在受限环境里验证打包一律用 `-OneDir`，onefile 只做构建与普通会话验证。
+- 受限沙箱**禁止写工作区之外的路径**：`%LOCALAPPDATA%\pictureSaver2\desktop.log` 与 `instance.json`
+  在沙箱内写不进去（`os.access` 会误报为可写，实际 `FileHandler` 抛 PermissionError）。
+  沙箱内排查桌面端问题请看控制台版构建（`--console`）的 stdout。
 - 淘汰策略只允许淘汰**终局**任务，进行中的任务永不被驱逐。

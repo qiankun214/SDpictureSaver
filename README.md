@@ -256,8 +256,28 @@ python -m pytest -q          # 103 项单元 / 接口 / 端到端 / 桌面用例
 4. 目录浏览性能基线可复现：`python scripts\bench_browse.py`（20000 文件：旧实现 ~1435 ms → 新实现 ~15 ms）
 5. CLI 四种用法（scan / dry-run / 真实拷贝 / web）实跑通过，扫描与复制都有 tqdm 进度条
 6. **桌面端**：`pytest` 新增 13 项（端口回退、服务引导与静态资源、健康检查超时、单实例锁、`--smoke` 报告、CLI 注册、Qt 延迟导入约定）；
-   源码运行与**打包后的 exe** 都用 CDP 连上真实窗口验证（窗口标题、界面已连上后端、后台任务中心已渲染、窗口内可直接调接口）并截图；
-   `dist\pictureSaver2.exe --smoke` 返回 `ok: true`
+   源码运行的真实桌面窗口已用 CDP 核对（标题、后端已连接、后台任务中心已渲染、窗口内可直接调接口）并截图；
+   打包产物在本环境下的实测结论见下表。
+
+### 打包验证结果（2026-10-11 实测）
+
+| 产物 | 本环境（受限沙箱） | 结论 |
+| --- | --- | --- |
+| `dist\pictureSaver2\`（onedir） | ✅ **跑通**：`--smoke` 返回 `{"ok": true, "health": true, "index": true, "index_bytes": 20865}`，有无控制台/句柄都一样 | onedir 无父子进程拆分，受限环境也能运行 |
+| `dist\pictureSaver2.exe`（onefile） | ❌ 本环境起不来：`_MEI` 解压成功，但引导器与子进程的握手失败（退出码 -1） | **构建正常**，但需在普通会话里运行；受限沙箱用 onedir |
+| 桌面窗口（QtWebEngine/Chromium） | ❌ 本环境起不来：`FATAL:named-platform-channel-pipe ... 拒绝访问 (0x5)`（我们的代码与本地服务已正常启动，仅 Chromium 无法建管道） | 需非受限会话；源码运行时的窗口已于 10/7 在不受限会话验证并截图（见上图 09） |
+| 桌面日志 `%LOCALAPPDATA%\pictureSaver2\desktop.log` | ⚠️ 受限沙箱**禁止写工作区外路径**（`os.access` 说可写，实际 `FileHandler` 抛 PermissionError） | 普通会话正常；沙箱内排错要靠控制台版的 stdout |
+
+**在普通会话里验证 exe（两条命令）**：
+
+```powershell
+Start-Process dist\pictureSaver2.exe -ArgumentList '--smoke','--port','8797' -Wait
+Get-Content "$env:TEMP\picsaver2-smoke.json"      # 期望 {"ok": true, ...}
+
+python scripts\verify_desktop.py --launch-exe dist\pictureSaver2.exe --app-port 8797 --cdp-port 9223
+```
+
+> 若只想在本机（含受限环境）拿到"能跑起来的打包产物"，用目录版：`.\build_desktop.ps1 -OneDir`。
 
 ### 复现浏览器验证
 
