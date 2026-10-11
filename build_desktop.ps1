@@ -56,11 +56,13 @@ if (-not (Test-Path 'src\picsaver\desktop\icon.ico')) {
 if ($OneDir) {
     Write-Host "Building ONEDIR ..."
     New-Item -ItemType Directory -Force -Path build | Out-Null
+    # 注意：给了 --specpath 之后，PyInstaller 以 spec 所在目录为基准解析相对路径，
+    # 所以这里所有路径都用绝对路径（$root 前缀），否则会报 "Unable to find ... web"。
     & $python -m PyInstaller --noconfirm --clean --onedir --windowed --name pictureSaver2 `
         --specpath build --workpath "build\onedir" --distpath dist `
-        --icon "src\picsaver\desktop\icon.ico" `
-        --add-data "src\picsaver\web;picsaver\web" `
-        --paths src `
+        --icon "$root\src\picsaver\desktop\icon.ico" `
+        --add-data "$root\src\picsaver\web;picsaver\web" `
+        --paths "$root\src" `
         --hidden-import uvicorn.logging `
         --hidden-import uvicorn.loops.auto `
         --hidden-import uvicorn.protocols.http.auto `
@@ -68,7 +70,7 @@ if ($OneDir) {
         --hidden-import uvicorn.lifespan.on `
         --hidden-import sse_starlette.sse `
         --exclude-module pytest --exclude-module tkinter --exclude-module pydoc `
-        "src\picsaver\desktop\__main__.py"
+        "$root\src\picsaver\desktop\__main__.py"
 } else {
     Write-Host "Building ONEFILE ..."
     & $python -m PyInstaller --noconfirm --clean "packaging\picsaver-desktop.spec"

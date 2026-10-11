@@ -103,39 +103,68 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run_web.ps1 8765
 - 刷新页面后，排队中 / 运行中的任务会自动恢复显示
 - 同一目标目录的第二个**拷贝**任务会被拒绝并提示（避免两个任务写同一批文件）
 
-## 4. 使用：桌面端（双击即用 / 打包 exe）
+## 4. 使用：桌面端（原生窗口 / 免打包）
 
 桌面端是**同一个程序的外壳**：起一个本地服务，再用 QtWebEngine 原生窗口加载**同一套 Web 界面**，
 所以功能、界面、进度显示与浏览器模式完全一致，不需要两边分别维护。
 
-```powershell
-# 开发/本机运行（需要 PySide6）
-.\run_desktop.cmd              # 默认端口 8765，被占用时自动换空闲端口
-.\run_desktop.cmd 9000         # 指定首选端口
-python -m picsaver desktop     # 等价写法
-picsaver desktop --smoke       # 只自检服务与静态资源，不开窗口（打包验证用）
-```
+### 怎么运行
 
-**打包成单个 exe**：
+**前置**：Python 3.10+ 与 PySide6（本机已装；缺就 `python -m pip install PySide6 -i https://pypi.tuna.tsinghua.edu.cn/simple`）。
 
 ```powershell
-.\build_desktop.ps1            # 默认 onefile -> dist\pictureSaver2.exe（约 200-300 MB）
-.\build_desktop.ps1 -OneDir    # 备选：目录版 dist\pictureSaver2\pictureSaver2.exe（启动更快、杀软误报更少）
+# 方式 1（推荐）：双击或命令行运行批处理入口
+.\run_desktop.cmd                  # 默认端口 8765，被占用时自动改用空闲端口
+.\run_desktop.cmd 9000             # 指定首选端口
+.\run_desktop.cmd --smoke          # 只自检（不开窗口）：验证服务与界面资源是否正常
+.\run_desktop.cmd 9000 --cdp-port 9222   # 打开 Chromium 调试端口（自动化验证用）
+
+# 方式 2：模块 / CLI（等价）
+$env:PYTHONPATH='src'
+python -m picsaver desktop         # 或 python -m picsaver desktop --port 9000
+picsaver desktop                   # 已 pip install -e . 时可直接用
+
+# 方式 3：做成"桌面软件"那样双击启动（无需打包）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\make_shortcut.ps1            # 桌面快捷方式
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\make_shortcut.ps1 -StartMenu # 开始菜单
 ```
 
-打包脚本会自动用清华镜像安装 PyInstaller（构建期依赖）。产物在 `dist/`（已在 `.gitignore` 中，不入库）。
+快捷方式指向 `run_desktop.cmd`、使用本项目的相机图标、控制台窗口最小化，双击即出窗口。
 
-**桌面端行为约定**
+**自检**（怀疑起不来时先跑这个，它不开窗口）：
+
+```powershell
+.\run_desktop.cmd --smoke
+# 输出 {"ok": true, "url": "http://127.0.0.1:8765", "health": true, "index": true, ...}
+# 同时写入 %TEMP%\picsaver2-smoke.json
+```
+
+### 行为约定
 
 | 行为 | 说明 |
 | --- | --- |
 | 关闭窗口 | 直接退出程序，本地服务随之停止 |
 | 有任务在跑时关闭 | 先弹确认框（说明已复制的文件会保留、不会留下半截文件），确认后先请求取消再退出 |
-| 重复双击 | 只保留一个服务实例；第二次会打开一个指向已有服务的窗口（关闭它不会影响已有服务） |
-| 端口占用 | 8765 被占用时自动改用系统分配的空闲端口 |
+| 重复双击 | 只保留一个服务实例；第二次会打开一个指向已有服务的窗口（关闭它不影响已有服务） |
+| 端口占用 | 首选端口被占用时自动改用系统分配的空闲端口 |
 | 窗口不可用 | 若 QtWebEngine 起不来，自动改用系统默认浏览器打开，并给出日志路径 |
 | 日志 | `%LOCALAPPDATA%\pictureSaver2\desktop.log`（窗口模式没有控制台，排错看这里） |
-| 自检 | `pictureSaver2.exe --smoke` 会写 `%TEMP%\picsaver2-smoke.json` 并在成功时返回 0 |
+| 快捷键 | `F5` 重新加载页面 |
+
+> ⚠️ **窗口必须在普通桌面会话里运行**：QtWebEngine（Chromium）依赖命名管道，
+> 受限沙箱会以 `named-platform-channel-pipe ... 拒绝访问 (0x5)` 直接中断；
+> 在普通终端/双击启动则正常。`--smoke` 不开窗口，任何环境都能跑。
+
+### 打包（可选，当前暂停）
+
+```powershell
+.\build_desktop.ps1            # onefile -> dist\pictureSaver2.exe（约 200 MB）
+.\build_desktop.ps1 -OneDir    # 目录版 -> dist\pictureSaver2\pictureSaver2.exe（启动更快）
+```
+
+构建脚本会自动用清华镜像装 PyInstaller（构建期依赖）。**目录版（`-OneDir`）实测可直接运行**
+（`--smoke` 返回 `ok:true`）；**单文件版（onefile）在受限沙箱里起不来**（引导器与子进程握手失败），
+需在普通会话里验证——这也是当前先不做打包、直接用上面"方式 1/2/3"的原因。
 
 ## 5. 使用：命令行
 
@@ -319,6 +348,11 @@ python scripts\verify_desktop.py --launch-exe dist\pictureSaver2.exe --app-port 
 
 ## 9. 常见问题
 
+- **桌面版怎么启动？** 双击 `run_desktop.cmd`（或先 `powershell -ExecutionPolicy Bypass -File scripts\make_shortcut.ps1`
+  在桌面建快捷方式），等价写法是 `python -m picsaver desktop`。窗口里就是同一套界面，**关闭窗口即退出**；
+  只想确认环境是否正常、不想开窗口，用 `.\run_desktop.cmd --smoke`。
+- **桌面窗口一闪就没了？** 先跑 `.\run_desktop.cmd --smoke` 看服务与界面资源是否正常，再看
+  `%LOCALAPPDATA%\pictureSaver2\desktop.log`；若弹窗提示窗口不可用，程序会自动改用浏览器打开同一界面。
 - **无 EXIF 时间的照片怎么办？** 会被跳过并列出。想一并归档时，可先用相机/软件写入拍摄时间，或单独手动处理这些文件。
 - **同名文件来自不同子目录？** 目标内自动加 `_1`、`_2`，并在报告中记为"重名改名"。
 - **能重复运行吗？** 可以。已存在且大小相同的文件会记为"已存在跳过"，不会重复写入。

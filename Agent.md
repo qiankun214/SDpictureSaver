@@ -99,6 +99,9 @@
 - 关闭窗口 = 退出程序；若仍有排队中/运行中的任务，必须先弹确认框，确认后先请求取消再退出。
 - 必须能打包为**单文件 exe**（PyInstaller onefile，`build_desktop.ps1` → `dist\pictureSaver2.exe`），
   且提供一个不依赖图形界面的自检模式（`--smoke`）用于打包验证。
+- 打包是**可选**能力：日常使用直接跑 `run_desktop.cmd` / `python -m picsaver desktop`；
+  还可以用 `scripts/make_shortcut.ps1` 在桌面/开始菜单建快捷方式（指向 `run_desktop.cmd`，用项目图标），
+  这样不打包也有"双击即用"的桌面体验。
 
 ## 8. 已确认的技术决策（用户确认，2026-10-06）
 
